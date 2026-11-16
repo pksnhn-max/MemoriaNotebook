@@ -1,0 +1,21 @@
+# MemoriaNotebook
+
+Gemini Notebook（旧 NotebookLM）の芯——資料の束＋検索＋出典縛りの対話——を
+Memoria の部品で組み、端末で完結させる Android アプリの試作リポジトリ。
+
+## 決まっている形
+
+- **B案**：核（記録層／検索／llama.cpp）を共有する別アプリとして試作し、
+  使い物になれば Memoria 本体の一画面として統合する。
+- **範囲**：ノート／ソース／出典付き対話＋音声概要のみ。他の Studio 生成物は作らない。
+- **モデル座**：対話はローカルが標準。API は設定で刺す opt-in の座で、
+  接続先・キー・モデル名は利用者が自由に設定する（BYOK 無制限）。
+  音声概要の台本生成だけは API 前提（ローカルには作らせない）。
+  音声合成は VOICEVOX（核の外、アプリ側）。
+- **二大原則**：Rust が基本／複雑よりシンプル。
+
+## 現在の段
+
+- `crates/notebook-core`：核の土台。`CoreState` の界面と記録層
+  （`notebooks.jsonl`／`sources.jsonl`／`turns.jsonl`）の初版。
+  検索と推論の接続は後段。
