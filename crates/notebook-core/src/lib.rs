@@ -278,6 +278,7 @@ impl CoreState {
 fn append_jsonl<T: Serialize>(path: &Path, rec: &T) -> CoreResult<()> {
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(f, "{}", serde_json::to_string(rec)?)?;
+    f.sync_all()?;
     Ok(())
 }
 
@@ -292,7 +293,13 @@ fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> CoreResult<Vec<T>> {
         if line.trim().is_empty() {
             continue;
         }
-        out.push(serde_json::from_str(&line)?);
+        match serde_json::from_str(&line) {
+            Ok(record) => out.push(record),
+            Err(_) => {
+                // Skip corrupted line, continue with next
+                continue;
+            }
+        }
     }
     Ok(out)
 }
@@ -380,5 +387,74 @@ mod tests {
         let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
         let r = st.add_source(42, SourceKind::Text, "x", "/x", 1);
         assert!(matches!(r, Err(CoreError::NotebookNotFound(42))));
+    }
+
+    #[test]
+    fn read_jsonl_skips_corrupted_lines() {
+        let dir = temp_dir();
+        let file = dir.join("corrupt.jsonl");
+        // Write: valid, corrupted, valid, empty line, corrupted, valid
+        fs::write(&file, "{\"id\":1,\"val\":\"a\"}\nnot json\n{\"id\":2,\"val\":\"b\"}\n\n{broken\n{\"id\":3,\"val\":\"c\"}\n").unwrap();
+
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        struct Rec {
+            id: u64,
+            val: String,
+        }
+
+        let recs: Vec<Rec> = read_jsonl(&file).unwrap();
+        assert_eq!(recs.len(), 3);
+        assert_eq!(recs[0].id, 1);
+        assert_eq!(recs[1].id, 2);
+        assert_eq!(recs[2].id, 3);
+    }
+
+    #[test]
+    fn append_then_reload_ids_monotonic_no_duplicates() {
+        let dir = temp_dir();
+        // First session: create notebook and source
+        {
+            let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+            let nb = st.create_notebook("NB", 10).unwrap();
+            assert_eq!(nb.id, 1);
+            let src = st.add_source(nb.id, SourceKind::Pdf, "S", "/s.pdf", 11).unwrap();
+            assert_eq!(src.id, 1);
+            st.append_turn(&ChatTurn {
+                nb: nb.id,
+                role: Role::User,
+                text: "hello".into(),
+                citations: vec![],
+                at: 12,
+            }).unwrap();
+        }
+        // Second session: reload and continue
+        {
+            let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+            assert_eq!(st.notebooks().len(), 1);
+            assert_eq!(st.sources_of(1).len(), 1);
+            let nb = st.create_notebook("NB2", 20).unwrap();
+            assert_eq!(nb.id, 2); // continues from 1
+            let src = st.add_source(nb.id, SourceKind::Text, "S2", "/s2.txt", 21).unwrap();
+            assert_eq!(src.id, 2); // continues from 1
+            st.append_turn(&ChatTurn {
+                nb: nb.id,
+                role: Role::Assistant,
+                text: "world".into(),
+                citations: vec![],
+                at: 22,
+            }).unwrap();
+        }
+        // Third session: verify all present and IDs unique
+        {
+            let st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+            let nbs = st.notebooks();
+            assert_eq!(nbs.len(), 2);
+            let ids: Vec<u64> = nbs.iter().map(|n| n.id).collect();
+            assert_eq!(ids, vec![1, 2]);
+            let srcs: Vec<_> = st.sources.iter().map(|s| s.id).collect();
+            assert_eq!(srcs, vec![1, 2]);
+            let turns: Vec<ChatTurn> = read_jsonl(&dir.join("turns.jsonl")).unwrap();
+            assert_eq!(turns.len(), 2);
+        }
     }
 }
