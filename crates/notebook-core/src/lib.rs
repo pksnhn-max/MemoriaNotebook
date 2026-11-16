@@ -9,13 +9,20 @@
 //!   (BYOK, unrestricted). The API key itself never lives in this crate's
 //!   config on disk — the app hands it in at call time from its vault.
 //! - Citations are record-level for now (one entry per source record).
-//!   Chunk-level citations arrive later via a sidecar index.
+//!   The chunk sidecar (`chunks.jsonl`, paragraph units of roughly 400
+//!   characters) is in place, and `Citation` can already carry a chunk
+//!   id; the embedding sidecar (`emb_chunks.bin`) and chunk-level
+//!   retrieval arrive with the retrieval binding.
 //! - Retrieval and inference are not wired yet; the async retrieval
 //!   contract of the shipped Memoria core (`emb_query_begin` /
 //!   `retrieval_select` / `RetrWait`) is the shape this crate will bind to.
+//!
+//! Ownership contract: `CoreState` is a single-owner value. Mutations
+//! take `&mut self`; the host app serializes access (one owner thread,
+//! or an external lock). It is not internally synchronized.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -90,10 +97,31 @@ pub struct SourceRec {
     pub added_at: u64,
 }
 
-/// A record-level citation: the reply leaned on this source record.
+/// A citation: the reply leaned on this source record. `chunk_id` is
+/// set when the grounding chunk is known (chunk-level citation); older
+/// records without the field read back as `None`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Citation {
     pub source_id: u64,
+    #[serde(default)]
+    pub chunk_id: Option<u64>,
+}
+
+/// One chunk of a source's text, in the chunk sidecar (`chunks.jsonl`).
+/// Chunks are paragraph units of roughly 400 characters. Re-chunking a
+/// source appends a new set with a higher `rev`; readers keep only the
+/// newest `rev` per source, so the append-only file stays consistent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChunkRec {
+    pub id: u64,
+    pub source_id: u64,
+    /// Owning notebook (denormalized for scoped reads).
+    pub nb: u64,
+    /// Order inside the source, 0-based.
+    pub ord: usize,
+    /// Revision of the source's chunk set.
+    pub rev: u64,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +168,7 @@ pub enum CoreError {
     Io(io::Error),
     Json(serde_json::Error),
     NotebookNotFound(u64),
+    SourceNotFound(u64),
 }
 
 impl From<io::Error> for CoreError {
@@ -160,6 +189,7 @@ impl std::fmt::Display for CoreError {
             CoreError::Io(e) => write!(f, "io: {e}"),
             CoreError::Json(e) => write!(f, "json: {e}"),
             CoreError::NotebookNotFound(id) => write!(f, "notebook not found: {id}"),
+            CoreError::SourceNotFound(id) => write!(f, "source not found: {id}"),
         }
     }
 }
@@ -174,8 +204,13 @@ pub struct CoreState {
     local_model_display_name: String,
     notebooks: Vec<Notebook>,
     sources: Vec<SourceRec>,
+    /// Latest chunk set per source (older `rev`s in the file are dropped
+    /// at load).
+    chunks: Vec<ChunkRec>,
+    chunk_rev: BTreeMap<u64, u64>,
     next_notebook_id: u64,
     next_source_id: u64,
+    next_chunk_id: u64,
 }
 
 impl CoreState {
@@ -188,16 +223,31 @@ impl CoreState {
         fs::create_dir_all(data_dir)?;
         let notebooks: Vec<Notebook> = read_jsonl(&data_dir.join("notebooks.jsonl"))?;
         let sources: Vec<SourceRec> = read_jsonl(&data_dir.join("sources.jsonl"))?;
+        let all_chunks: Vec<ChunkRec> = read_jsonl(&data_dir.join("chunks.jsonl"))?;
         let next_notebook_id = notebooks.iter().map(|n| n.id).max().unwrap_or(0) + 1;
         let next_source_id = sources.iter().map(|s| s.id).max().unwrap_or(0) + 1;
+        let next_chunk_id = all_chunks.iter().map(|c| c.id).max().unwrap_or(0) + 1;
+        // Keep only the newest revision per source.
+        let mut chunk_rev: BTreeMap<u64, u64> = BTreeMap::new();
+        for c in &all_chunks {
+            let e = chunk_rev.entry(c.source_id).or_insert(0);
+            *e = (*e).max(c.rev);
+        }
+        let chunks: Vec<ChunkRec> = all_chunks
+            .into_iter()
+            .filter(|c| chunk_rev.get(&c.source_id) == Some(&c.rev))
+            .collect();
         Ok(CoreState {
             data_dir: data_dir.to_path_buf(),
             cfg,
             local_model_display_name: local_model_display_name.to_string(),
             notebooks,
             sources,
+            chunks,
+            chunk_rev,
             next_notebook_id,
             next_source_id,
+            next_chunk_id,
         })
     }
 
@@ -255,6 +305,53 @@ impl CoreState {
         Ok(rec)
     }
 
+    /// Chunk a source's full text into the sidecar. Replaces the
+    /// source's previous chunk set (a new `rev` is appended; the old
+    /// set stops being visible at once and is dropped at next load).
+    pub fn set_source_text(
+        &mut self,
+        source_id: u64,
+        text: &str,
+    ) -> CoreResult<Vec<ChunkRec>> {
+        let src = self
+            .sources
+            .iter()
+            .find(|s| s.id == source_id)
+            .ok_or(CoreError::SourceNotFound(source_id))?;
+        let nb = src.nb;
+        let rev = self.chunk_rev.get(&source_id).copied().unwrap_or(0) + 1;
+        let path = self.data_dir.join("chunks.jsonl");
+        let mut made = Vec::new();
+        for (ord, piece) in chunk_text(text).into_iter().enumerate() {
+            let rec = ChunkRec {
+                id: self.next_chunk_id,
+                source_id,
+                nb,
+                ord,
+                rev,
+                text: piece,
+            };
+            append_jsonl(&path, &rec)?;
+            self.next_chunk_id += 1;
+            made.push(rec);
+        }
+        self.chunks.retain(|c| c.source_id != source_id);
+        self.chunks.extend(made.iter().cloned());
+        self.chunk_rev.insert(source_id, rev);
+        Ok(made)
+    }
+
+    /// The current chunks of one source, in reading order.
+    pub fn chunks_of(&self, source_id: u64) -> Vec<&ChunkRec> {
+        let mut v: Vec<&ChunkRec> = self
+            .chunks
+            .iter()
+            .filter(|c| c.source_id == source_id)
+            .collect();
+        v.sort_by_key(|c| c.ord);
+        v
+    }
+
     pub fn append_turn(&self, turn: &ChatTurn) -> CoreResult<()> {
         append_jsonl(&self.data_dir.join("turns.jsonl"), turn)
     }
@@ -273,6 +370,71 @@ impl CoreState {
         }
         scope
     }
+}
+
+/// Target chunk size in characters (paragraph units, roughly 400).
+pub const CHUNK_TARGET_CHARS: usize = 400;
+
+/// Split text into chunks: paragraphs (blank-line separated) are packed
+/// in order into chunks of at most roughly `CHUNK_TARGET_CHARS`
+/// characters; a paragraph longer than twice the target is hard-split
+/// near the target, preferring a sentence end (`。` / `、`).
+pub fn chunk_text(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for para in text.split("\n\n") {
+        let para = para.trim();
+        if para.is_empty() {
+            continue;
+        }
+        if para.chars().count() > CHUNK_TARGET_CHARS * 2 {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            out.extend(hard_split(para));
+            continue;
+        }
+        let need = para.chars().count()
+            + if cur.is_empty() {
+                0
+            } else {
+                cur.chars().count() + 1
+            };
+        if !cur.is_empty() && need > CHUNK_TARGET_CHARS {
+            out.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push('\n');
+        }
+        cur.push_str(para);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn hard_split(para: &str) -> Vec<String> {
+    let chars: Vec<char> = para.chars().collect();
+    let mut out = Vec::new();
+    let mut start = 0;
+    while chars.len() - start > CHUNK_TARGET_CHARS {
+        let limit = start + CHUNK_TARGET_CHARS;
+        // Look back a little for a sentence break.
+        let mut cut = limit;
+        for i in (start + CHUNK_TARGET_CHARS / 2..limit).rev() {
+            if chars[i] == '。' || chars[i] == '、' {
+                cut = i + 1;
+                break;
+            }
+        }
+        out.push(chars[start..cut].iter().collect());
+        start = cut;
+    }
+    if start < chars.len() {
+        out.push(chars[start..].iter().collect());
+    }
+    out
 }
 
 fn append_jsonl<T: Serialize>(path: &Path, rec: &T) -> CoreResult<()> {
@@ -371,7 +533,10 @@ mod tests {
             nb: nb.id,
             role: Role::Assistant,
             text: "答え".into(),
-            citations: vec![Citation { source_id: src.id }],
+            citations: vec![Citation {
+                source_id: src.id,
+                chunk_id: None,
+            }],
             at: 3,
         })
         .unwrap();
@@ -379,6 +544,96 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].citations[0].source_id, src.id);
         assert!(st.turns_of(999).unwrap().is_empty());
+    }
+
+    #[test]
+    fn chunk_text_packs_paragraphs_near_target() {
+        let p = "あ".repeat(150);
+        let text = format!("{p}\n\n{p}\n\n{p}\n\n{p}");
+        let chunks = chunk_text(&text);
+        // 150x2=300 fits, +150 would pass 400 -> 2 chunks of 2 paragraphs.
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|c| c.chars().count() <= 301));
+        assert_eq!(chunks.join("").matches('あ').count(), 150 * 4);
+    }
+
+    #[test]
+    fn chunk_text_hard_splits_long_paragraph() {
+        let text = "い".repeat(1000);
+        let chunks = chunk_text(&text);
+        assert!(chunks.len() >= 3);
+        assert!(chunks.iter().all(|c| c.chars().count() <= CHUNK_TARGET_CHARS));
+        assert_eq!(chunks.join(""), text);
+    }
+
+    #[test]
+    fn source_text_roundtrip_and_rechunk_replaces() {
+        let dir = temp_dir();
+        let (nb_id, src_id, first_ids) = {
+            let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+            let nb = st.create_notebook("A", 1).unwrap();
+            let src = st
+                .add_source(nb.id, SourceKind::Text, "s", "/data/s.txt", 2)
+                .unwrap();
+            let made = st
+                .set_source_text(src.id, "第一段落。\n\n第二段落。")
+                .unwrap();
+            assert_eq!(made.len(), 1); // short paragraphs pack into one chunk
+            (nb.id, src.id, made.iter().map(|c| c.id).collect::<Vec<_>>())
+        };
+        {
+            let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+            let got = st.chunks_of(src_id);
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[0].nb, nb_id);
+            // Re-chunk with different text: old set must vanish at once.
+            let p = "う".repeat(300);
+            let made = st
+                .set_source_text(src_id, &format!("{p}\n\n{p}"))
+                .unwrap();
+            assert_eq!(made.len(), 2);
+            assert!(made.iter().all(|c| !first_ids.contains(&c.id)));
+            assert_eq!(st.chunks_of(src_id).len(), 2);
+        }
+        // After reload, only the newest revision survives.
+        let st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+        let got = st.chunks_of(src_id);
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().all(|c| c.rev == 2));
+        assert_eq!(got[0].ord, 0);
+        assert_eq!(got[1].ord, 1);
+    }
+
+    #[test]
+    fn set_source_text_missing_source_fails() {
+        let dir = temp_dir();
+        let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+        let r = st.set_source_text(99, "x");
+        assert!(matches!(r, Err(CoreError::SourceNotFound(99))));
+    }
+
+    #[test]
+    fn citation_with_chunk_id_roundtrips() {
+        let dir = temp_dir();
+        let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+        let nb = st.create_notebook("A", 1).unwrap();
+        let src = st
+            .add_source(nb.id, SourceKind::Text, "s", "/data/s.txt", 2)
+            .unwrap();
+        let made = st.set_source_text(src.id, "根拠の文。").unwrap();
+        st.append_turn(&ChatTurn {
+            nb: nb.id,
+            role: Role::Assistant,
+            text: "答え".into(),
+            citations: vec![Citation {
+                source_id: src.id,
+                chunk_id: Some(made[0].id),
+            }],
+            at: 3,
+        })
+        .unwrap();
+        let turns = st.turns_of(nb.id).unwrap();
+        assert_eq!(turns[0].citations[0].chunk_id, Some(made[0].id));
     }
 
     #[test]
