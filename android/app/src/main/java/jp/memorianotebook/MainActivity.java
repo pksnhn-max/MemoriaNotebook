@@ -53,6 +53,23 @@ public final class MainActivity extends Activity {
         return (int) (v * getResources().getDisplayMetrics().density);
     }
 
+    /** Proportional scale for the top blocks (headers, chips,
+     *  overview card): sizes follow the screen width as a ratio of
+     *  the 400dp design width, capped so text stays readable. */
+    private float uiScale() {
+        float widthDp = getResources().getDisplayMetrics().widthPixels
+                / getResources().getDisplayMetrics().density;
+        return Math.max(1f, Math.min(1.35f, widthDp / 400f));
+    }
+
+    private int sdp(int v) {
+        return dp(Math.round(v * uiScale()));
+    }
+
+    private float ssp(float sp) {
+        return sp * uiScale();
+    }
+
     private GradientDrawable cardBg() {
         GradientDrawable g = new GradientDrawable();
         g.setColor(surface);
@@ -143,7 +160,7 @@ public final class MainActivity extends Activity {
 
         screen = column();
         screen.setBackgroundColor(ground);
-        screen.setPadding(dp(16), dp(12), dp(16), dp(16));
+        screen.setPadding(sdp(16), sdp(12), sdp(16), sdp(16));
 
         scroll = new ScrollView(this);
         scroll.setBackgroundColor(ground);
@@ -227,7 +244,7 @@ public final class MainActivity extends Activity {
         LinearLayout head = new LinearLayout(this);
         head.setOrientation(LinearLayout.HORIZONTAL);
         head.setGravity(Gravity.CENTER_VERTICAL);
-        TextView title = text("ノート", 26, ink, false, true);
+        TextView title = text("ノート", ssp(26), ink, false, true);
         title.setLayoutParams(new LinearLayout.LayoutParams(
                 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         head.addView(title);
@@ -251,13 +268,13 @@ public final class MainActivity extends Activity {
         for (int i = 0; i < chipLabels.length; i++) {
             final int idx = i;
             boolean on = i == listFilter;
-            TextView chip = text(chipLabels[i], 12.5f, on ? ground : sub, false, on);
+            TextView chip = text(chipLabels[i], ssp(12.5f), on ? ground : sub, false, on);
             GradientDrawable cg = new GradientDrawable();
             cg.setColor(on ? ink : Color.TRANSPARENT);
-            cg.setCornerRadius(dp(16));
+            cg.setCornerRadius(sdp(16));
             if (!on) cg.setStroke(1, hairline);
             chip.setBackground(cg);
-            chip.setPadding(dp(11), dp(6), dp(11), dp(6));
+            chip.setPadding(sdp(11), sdp(6), sdp(11), sdp(6));
             LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.WRAP_CONTENT,
                     LinearLayout.LayoutParams.WRAP_CONTENT);
@@ -455,7 +472,7 @@ public final class MainActivity extends Activity {
         LinearLayout head = new LinearLayout(this);
         head.setOrientation(LinearLayout.HORIZONTAL);
         head.setGravity(Gravity.CENTER_VERTICAL);
-        TextView back = text("←", 20, ink, false, false);
+        TextView back = text("←", ssp(20), ink, false, false);
         back.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -463,7 +480,7 @@ public final class MainActivity extends Activity {
             }
         });
         head.addView(back);
-        TextView t = text(title, 17, ink, true, true);
+        TextView t = text(title, ssp(17), ink, true, true);
         LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(
                 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
         tp.leftMargin = dp(10);
@@ -518,9 +535,9 @@ public final class MainActivity extends Activity {
 
         LinearLayout card = column();
         card.setBackground(cardBg());
-        card.setPadding(dp(14), dp(12), dp(14), dp(12));
-        card.addView(text(currentTitle, 18, ink, true, true));
-        TextView meta = text(srcCount + " 件のソース", 12, sub, false, false);
+        card.setPadding(sdp(14), sdp(12), sdp(14), sdp(12));
+        card.addView(text(currentTitle, ssp(18), ink, true, true));
+        TextView meta = text(srcCount + " 件のソース", ssp(12), sub, false, false);
         card.addView(meta);
         if (srcCount > 0) {
             StringBuilder names = new StringBuilder("資料：");
