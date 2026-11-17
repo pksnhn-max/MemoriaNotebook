@@ -213,6 +213,19 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_addTextSource(
     .unwrap_or(-1)
 }
 
+/// Delete (tombstone) a notebook; false on failure.
+#[no_mangle]
+pub extern "C" fn Java_jp_memorianotebook_Bridge_deleteNotebook(
+    _env: JNIEnv,
+    _class: JClass,
+    nb: jlong,
+) -> jboolean {
+    match with_state(|st| st.delete_notebook(nb as u64)) {
+        Ok(()) => 1,
+        Err(_) => 0,
+    }
+}
+
 /// Ask one question; returns the assistant's answer text, or a
 /// string starting with `ERR:` on failure.
 #[no_mangle]

@@ -39,6 +39,7 @@ public final class MainActivity extends Activity {
 
     private ScrollView scroll;
     private LinearLayout screen;
+    private LinearLayout bottomBar;
 
     private long currentNb = -1;
     private String currentTitle = "";
@@ -145,7 +146,18 @@ public final class MainActivity extends Activity {
         scroll = new ScrollView(this);
         scroll.setBackgroundColor(ground);
         scroll.addView(screen);
-        scroll.setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {
+        scroll.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        bottomBar = column();
+        bottomBar.setBackgroundColor(ground);
+        bottomBar.setPadding(dp(16), dp(6), dp(16), dp(10));
+
+        LinearLayout root = column();
+        root.setBackgroundColor(ground);
+        root.addView(scroll);
+        root.addView(bottomBar);
+        root.setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {
             @Override
             public WindowInsets onApplyWindowInsets(View v, WindowInsets insets) {
                 v.setPadding(
@@ -156,7 +168,7 @@ public final class MainActivity extends Activity {
                 return insets.consumeSystemWindowInsets();
             }
         });
-        setContentView(scroll);
+        setContentView(root);
 
         try {
             if (!Bridge.init(getFilesDir().getAbsolutePath())) {
@@ -187,7 +199,21 @@ public final class MainActivity extends Activity {
 
     private void clearScreen() {
         screen.removeAllViews();
+        bottomBar.removeAllViews();
         scroll.scrollTo(0, 0);
+    }
+
+    /** A pill-shaped button in the design-2 tone (no default grey slab). */
+    private Button pillBtn(String label) {
+        Button b = new Button(this);
+        b.setText(label);
+        b.setTextColor(ink);
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(hairline);
+        g.setCornerRadius(dp(20));
+        b.setBackground(g);
+        b.setPadding(dp(16), 0, dp(16), 0);
+        return b;
     }
 
     // ---------- nb1: notebook list ----------
@@ -216,19 +242,22 @@ public final class MainActivity extends Activity {
         TextView tabs = text("すべて    最近    ダウンロード済み", 14, sub, false, false);
         screen.addView(tabs, matchWrap(14));
 
-        // New-notebook row: title field + create button (the mock's
-        // "＋ 新しいノートを作成" card, opened inline).
-        LinearLayout createCard = column();
+        // New-notebook row (the mock's "＋ 新しいノートを作成" card):
+        // one row — title field and a small create pill side by side.
+        LinearLayout createCard = new LinearLayout(this);
+        createCard.setOrientation(LinearLayout.HORIZONTAL);
+        createCard.setGravity(Gravity.CENTER_VERTICAL);
         createCard.setBackground(cardBg());
-        createCard.setPadding(dp(14), dp(12), dp(14), dp(12));
+        createCard.setPadding(dp(14), dp(6), dp(10), dp(6));
         final EditText newTitle = new EditText(this);
-        newTitle.setHint("＋ 新しいノートを作成（タイトルを入力）");
+        newTitle.setHint("＋ 新しいノートを作成");
         newTitle.setTextColor(ink);
         newTitle.setHintTextColor(sub);
         newTitle.setBackgroundColor(Color.TRANSPARENT);
+        newTitle.setLayoutParams(new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         createCard.addView(newTitle);
-        Button createBtn = new Button(this);
-        createBtn.setText("作成");
+        Button createBtn = pillBtn("作成");
         createBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -303,6 +332,24 @@ public final class MainActivity extends Activity {
                 showNotebook(id, title, 1);
             }
         });
+        card.setOnLongClickListener(new View.OnLongClickListener() {
+            @Override
+            public boolean onLongClick(View v) {
+                new android.app.AlertDialog.Builder(MainActivity.this)
+                        .setTitle(title)
+                        .setMessage("このノートを削除しますか？（資料と履歴も一覧から消えます）")
+                        .setPositiveButton("削除", new android.content.DialogInterface.OnClickListener() {
+                            @Override
+                            public void onClick(android.content.DialogInterface d, int w) {
+                                Bridge.deleteNotebook(id);
+                                showList();
+                            }
+                        })
+                        .setNegativeButton("やめる", null)
+                        .show();
+                return true;
+            }
+        });
         return card;
     }
 
@@ -340,7 +387,7 @@ public final class MainActivity extends Activity {
         else if (tab == 2) buildStudio(body);
         else buildChat(body);
 
-        screen.addView(tabBar(), matchWrap(16));
+        bottomBar.addView(tabBar());
     }
 
     private View tabBar() {
@@ -375,7 +422,8 @@ public final class MainActivity extends Activity {
     // ---------- nb2: chat ----------
 
     private void buildChat(LinearLayout body) {
-        int srcCount = lines(Bridge.listSources(currentNb)).length;
+        String[][] srcList = lines(Bridge.listSources(currentNb));
+        int srcCount = srcList.length;
 
         LinearLayout card = column();
         card.setBackground(cardBg());
@@ -383,6 +431,20 @@ public final class MainActivity extends Activity {
         card.addView(text(currentTitle, 18, ink, true, true));
         TextView meta = text(srcCount + " ソース", 12, sub, false, false);
         card.addView(meta);
+        if (srcCount > 0) {
+            StringBuilder names = new StringBuilder("資料：");
+            for (int i = 0; i < srcList.length; i++) {
+                if (i > 0) names.append("、");
+                if (srcList[i].length > 1) names.append(unesc(srcList[i][1]));
+            }
+            TextView nl = text(names.toString(), 12, sub, false, false);
+            LinearLayout.LayoutParams np = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT);
+            np.topMargin = dp(4);
+            nl.setLayoutParams(np);
+            card.addView(nl);
+        }
         body.addView(card);
 
         String[][] turns = lines(Bridge.listTurns(currentNb));
@@ -443,8 +505,7 @@ public final class MainActivity extends Activity {
         input.setLayoutParams(new LinearLayout.LayoutParams(
                 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         inputRow.addView(input);
-        Button send = new Button(this);
-        send.setText("↑");
+        Button send = pillBtn("↑");
         LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT);
@@ -497,8 +558,7 @@ public final class MainActivity extends Activity {
         srcBody.setBackgroundColor(Color.TRANSPARENT);
         srcBody.setMinLines(4);
         add.addView(srcBody);
-        Button addBtn = new Button(this);
-        addBtn.setText("テキスト資料を追加");
+        Button addBtn = pillBtn("テキスト資料を追加");
         addBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -530,16 +590,15 @@ public final class MainActivity extends Activity {
         big.setLayoutParams(bp);
         card.addView(big);
         TextView desc = text("選択中のソースから、対話形式の音声を生成します。"
-                + "台本は API のモデルが書きます（設定で接続してください）。"
-                + "生成の実装は次の段で入ります。", 13, sub, false, false);
+                + "台本は API のモデルが書きます（未設定のときは設定へ案内します）。"
+                + "生成機能は準備中です。", 13, sub, false, false);
         LinearLayout.LayoutParams dsp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT);
         dsp.topMargin = dp(6);
         desc.setLayoutParams(dsp);
         card.addView(desc);
-        Button gen = new Button(this);
-        gen.setText("生成する");
+        Button gen = pillBtn("生成する");
         gen.setEnabled(false);
         card.addView(gen, matchWrap(10));
         body.addView(card, matchWrap(10));

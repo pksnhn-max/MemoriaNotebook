@@ -241,10 +241,19 @@ impl CoreState {
         local_model_display_name: &str,
     ) -> CoreResult<Self> {
         fs::create_dir_all(data_dir)?;
-        let notebooks: Vec<Notebook> = read_jsonl(&data_dir.join("notebooks.jsonl"))?;
+        let all_notebooks: Vec<Notebook> = read_jsonl(&data_dir.join("notebooks.jsonl"))?;
+        // The id counter runs over ALL notebooks ever created,
+        // including deleted ones, so ids are never reused.
+        let next_notebook_id = all_notebooks.iter().map(|n| n.id).max().unwrap_or(0) + 1;
+        // Tombstones: ids in deleted.jsonl are dropped from the live
+        // list (the records themselves stay in their files).
+        let deleted: Vec<u64> = read_jsonl(&data_dir.join("deleted.jsonl"))?;
+        let notebooks: Vec<Notebook> = all_notebooks
+            .into_iter()
+            .filter(|n| !deleted.contains(&n.id))
+            .collect();
         let sources: Vec<SourceRec> = read_jsonl(&data_dir.join("sources.jsonl"))?;
         let all_chunks: Vec<ChunkRec> = read_jsonl(&data_dir.join("chunks.jsonl"))?;
-        let next_notebook_id = notebooks.iter().map(|n| n.id).max().unwrap_or(0) + 1;
         let next_source_id = sources.iter().map(|s| s.id).max().unwrap_or(0) + 1;
         let next_chunk_id = all_chunks.iter().map(|c| c.id).max().unwrap_or(0) + 1;
         // Keep only the newest revision per source.
@@ -303,6 +312,20 @@ impl CoreState {
         self.next_notebook_id += 1;
         self.notebooks.push(nb.clone());
         Ok(nb)
+    }
+
+    /// Tombstone a notebook: append its id to `deleted.jsonl` and
+    /// drop it from the live list. Its sources/turns stay in their
+    /// files but become unreachable. Unknown ids are an error.
+    pub fn delete_notebook(&mut self, id: u64) -> CoreResult<()> {
+        let pos = self
+            .notebooks
+            .iter()
+            .position(|n| n.id == id)
+            .ok_or(CoreError::NotebookNotFound(id))?;
+        append_jsonl(&self.data_dir.join("deleted.jsonl"), &id)?;
+        self.notebooks.remove(pos);
+        Ok(())
     }
 
     pub fn add_source(
@@ -799,6 +822,25 @@ mod tests {
             }
             Ok(vec)
         }
+    }
+
+    #[test]
+    fn delete_notebook_tombstones_and_never_reuses_id() {
+        let dir = temp_dir();
+        let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+        let a = st.create_notebook("A", 1).unwrap();
+        let b = st.create_notebook("B", 2).unwrap();
+        st.delete_notebook(b.id).unwrap();
+        assert_eq!(st.notebooks().len(), 1);
+        assert!(st.delete_notebook(999).is_err());
+        drop(st);
+        // After reload the tombstone still applies, and the next id
+        // does not reuse the deleted notebook's id.
+        let mut st2 = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+        assert_eq!(st2.notebooks().len(), 1);
+        assert_eq!(st2.notebooks()[0].id, a.id);
+        let c = st2.create_notebook("C", 3).unwrap();
+        assert_eq!(c.id, b.id + 1);
     }
 
     #[test]
