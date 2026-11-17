@@ -613,6 +613,73 @@ fn l2_norm(v: &[f32]) -> f32 {
     v.iter().map(|x| x * x).sum::<f32>().sqrt()
 }
 
+/// Format retrieved chunks as a grounding block for the prompt.
+/// Each hit becomes `[#<chunk_id>] <text>` on its own line, with a blank line between hits.
+/// Scores are not included. Empty input yields empty string.
+pub fn format_grounding(hits: &[(ChunkRec, f32)]) -> String {
+    if hits.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for (i, (chunk, _score)) in hits.iter().enumerate() {
+        if i > 0 {
+            out.push_str("\n\n");
+        }
+        out.push_str(&format!("[#{}] {}", chunk.id, chunk.text));
+    }
+    out
+}
+
+/// Parse citations from generated text.
+/// Scans `text` for markers of the form `[#<number>]`.
+/// Only markers whose number matches a `chunk_id` in `hits` are kept.
+/// Returns citations in order of first appearance, deduplicated by chunk_id.
+/// Markers with non-numeric content (e.g., `[#abc]`) are ignored.
+/// Markers referencing unknown chunk_ids are silently dropped.
+pub fn parse_citations(text: &str, hits: &[(ChunkRec, f32)]) -> Vec<Citation> {
+    // Build a quick lookup: chunk_id -> source_id
+    let mut chunk_to_source = HashMap::new();
+    for (chunk, _) in hits {
+        chunk_to_source.insert(chunk.id, chunk.source_id);
+    }
+
+    let mut citations = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Look for '[#'
+        if i + 2 < bytes.len() && bytes[i] == b'[' && bytes[i + 1] == b'#' {
+            let mut j = i + 2;
+            // Parse digits
+            let mut num = 0u64;
+            let mut has_digit = false;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                has_digit = true;
+                num = num.saturating_mul(10).saturating_add((bytes[j] - b'0') as u64);
+                j += 1;
+            }
+            // Expect closing ']'
+            if has_digit && j < bytes.len() && bytes[j] == b']' {
+                // Valid marker found
+                if let Some(&source_id) = chunk_to_source.get(&num) {
+                    if seen.insert(num) {
+                        citations.push(Citation {
+                            source_id,
+                            chunk_id: Some(num),
+                        });
+                    }
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    citations
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1097,6 +1164,135 @@ mod tests {
                     assert!(results[i-1].1 >= results[i].1);
                 }
             }
+        }
+    }
+
+    // --- Grounding / citation tests ---
+
+    #[test]
+    fn format_grounding_includes_chunk_id_and_text() {
+        let dir = temp_dir();
+        let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+        let nb = st.create_notebook("NB", 1).unwrap();
+        let src = st.add_source(nb.id, SourceKind::Text, "s", "/s.txt", 2).unwrap();
+        let made = st.set_source_text(src.id, &format!("{}\n\n{}", "第一の根拠。".repeat(60), "第二の根拠。".repeat(60))).unwrap();
+        assert_eq!(made.len(), 2);
+
+        let hits = vec![
+            (made[0].clone(), 0.9),
+            (made[1].clone(), 0.7),
+        ];
+        let grounded = format_grounding(&hits);
+        assert!(grounded.contains(&format!("[#{}]", made[0].id)));
+        assert!(grounded.contains(&format!("[#{}]", made[1].id)));
+        assert!(grounded.contains("第一の根拠"));
+        assert!(grounded.contains("第二の根拠"));
+        // Blank line between
+        assert!(grounded.contains("\n\n"));
+        // Scores not included
+        assert!(!grounded.contains("0.9"));
+        assert!(!grounded.contains("0.7"));
+    }
+
+    #[test]
+    fn format_grounding_empty_input_returns_empty() {
+        let grounded = format_grounding(&[]);
+        assert_eq!(grounded, "");
+    }
+
+    #[test]
+    fn parse_citations_picks_existing_in_order_dedup() {
+        let dir = temp_dir();
+        let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+        let nb = st.create_notebook("NB", 1).unwrap();
+        let src = st.add_source(nb.id, SourceKind::Text, "s", "/s.txt", 2).unwrap();
+        let made = st.set_source_text(src.id, &format!("{}\n\n{}\n\n{}", "A。".repeat(150), "B。".repeat(150), "C。".repeat(150))).unwrap();
+        assert_eq!(made.len(), 3);
+
+        let hits = vec![
+            (made[0].clone(), 0.9),
+            (made[1].clone(), 0.8),
+            (made[2].clone(), 0.7),
+        ];
+
+        // Text with citations in order, with duplicate
+        let text = "答え[#1]です[#3]ね[#1]";
+        let cits = parse_citations(text, &hits);
+        assert_eq!(cits.len(), 2);
+        assert_eq!(cits[0].chunk_id, Some(made[0].id));
+        assert_eq!(cits[1].chunk_id, Some(made[2].id));
+        assert_eq!(cits[0].source_id, src.id);
+        assert_eq!(cits[1].source_id, src.id);
+    }
+
+    #[test]
+    fn parse_citations_drops_unknown_chunk_ids() {
+        let dir = temp_dir();
+        let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+        let nb = st.create_notebook("NB", 1).unwrap();
+        let src = st.add_source(nb.id, SourceKind::Text, "s", "/s.txt", 2).unwrap();
+        let made = st.set_source_text(src.id, "のみ").unwrap();
+
+        let hits = vec![(made[0].clone(), 0.9)];
+        // Citation refers to non-existent chunk 999
+        let text = "答え[#999]です";
+        let cits = parse_citations(text, &hits);
+        assert!(cits.is_empty());
+    }
+
+    #[test]
+    fn parse_citations_ignores_non_numeric_markers() {
+        let dir = temp_dir();
+        let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+        let nb = st.create_notebook("NB", 1).unwrap();
+        let src = st.add_source(nb.id, SourceKind::Text, "s", "/s.txt", 2).unwrap();
+        let made = st.set_source_text(src.id, "テスト").unwrap();
+
+        let hits = vec![(made[0].clone(), 0.9)];
+        // Non-numeric marker should be ignored
+        let text = "答え[#abc]です[#1]";
+        let cits = parse_citations(text, &hits);
+        assert_eq!(cits.len(), 1);
+        assert_eq!(cits[0].chunk_id, Some(made[0].id));
+    }
+
+    #[test]
+    fn citation_roundtrip_append_and_reload() {
+        let dir = temp_dir();
+        let (nb_id, src_id, chunk_ids) = {
+            let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+            let nb = st.create_notebook("NB", 1).unwrap();
+            let src = st.add_source(nb.id, SourceKind::Text, "s", "/s.txt", 2).unwrap();
+            let made = st.set_source_text(src.id, &format!("{}\n\n{}", "根拠A。".repeat(100), "根拠B。".repeat(100))).unwrap();
+            (nb.id, src.id, made.iter().map(|c| c.id).collect::<Vec<_>>())
+        };
+        // Append a turn with parsed citations
+        {
+            let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+            let hits = vec![
+                (st.chunks.iter().find(|c| c.id == chunk_ids[0]).unwrap().clone(), 0.9),
+                (st.chunks.iter().find(|c| c.id == chunk_ids[1]).unwrap().clone(), 0.8),
+            ];
+            let text = "回答[#1]です[#2]";
+            let cits = parse_citations(text, &hits);
+            st.append_turn(&ChatTurn {
+                nb: nb_id,
+                role: Role::Assistant,
+                text: text.into(),
+                citations: cits,
+                at: 3,
+            }).unwrap();
+        }
+        // Reload and verify
+        {
+            let st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+            let turns = st.turns_of(nb_id).unwrap();
+            assert_eq!(turns.len(), 1);
+            assert_eq!(turns[0].citations.len(), 2);
+            assert_eq!(turns[0].citations[0].chunk_id, Some(chunk_ids[0]));
+            assert_eq!(turns[0].citations[1].chunk_id, Some(chunk_ids[1]));
+            assert_eq!(turns[0].citations[0].source_id, src_id);
+            assert_eq!(turns[0].citations[1].source_id, src_id);
         }
     }
 }
