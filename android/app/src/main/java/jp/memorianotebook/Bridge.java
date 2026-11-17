@@ -13,4 +13,10 @@ public final class Bridge {
     public static native long createNotebook(String title);
     public static native long addTextSource(long notebookId, String title, String text);
     public static native String ask(long notebookId, String question);
+    /** One line per notebook: id \t title \t created_at. */
+    public static native String listNotebooks();
+    /** One line per source: id \t title. */
+    public static native String listSources(long notebookId);
+    /** One line per turn: role \t text \t cited chunk ids (comma-separated). */
+    public static native String listTurns(long notebookId);
 }

@@ -74,6 +74,55 @@ impl Generator for CannedGenerator {
     }
 }
 
+/// Escape a field for the bridge's line format: backslash first,
+/// then tab and newline, so one record always stays on one line.
+fn esc(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\n', "\\n")
+}
+
+/// One line per notebook: `id \t title \t created_at`.
+fn fmt_notebooks(st: &CoreState) -> String {
+    st.notebooks()
+        .iter()
+        .map(|n| format!("{}\t{}\t{}", n.id, esc(&n.title), n.created_at))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One line per source of `nb`: `id \t title`.
+fn fmt_sources(st: &CoreState, nb: u64) -> String {
+    st.sources_of(nb)
+        .iter()
+        .map(|s| format!("{}\t{}", s.id, esc(&s.title)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One line per turn of `nb`: `role \t text \t cited chunk ids
+/// (comma-separated, empty when none)`.
+fn fmt_turns(st: &CoreState, nb: u64) -> CoreResult<String> {
+    let turns = st.turns_of(nb)?;
+    Ok(turns
+        .iter()
+        .map(|t| {
+            let role = match t.role {
+                notebook_core::Role::User => "user",
+                notebook_core::Role::Assistant => "assistant",
+            };
+            let cites = t
+                .citations
+                .iter()
+                .filter_map(|c| c.chunk_id.map(|id| id.to_string()))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{role}\t{}\t{cites}", esc(&t.text))
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
 fn with_state<T>(f: impl FnOnce(&mut CoreState) -> CoreResult<T>) -> Result<T, String> {
     let mut guard = STATE.lock().map_err(|_| "state poisoned".to_string())?;
     let st = guard.as_mut().ok_or("not initialized")?;
@@ -185,4 +234,103 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_ask(
     env.new_string(text)
         .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())
+}
+
+fn string_result(env: &mut JNIEnv, result: Result<String, String>) -> jstring {
+    let text = match result {
+        Ok(t) => t,
+        Err(e) => format!("ERR: {e}"),
+    };
+    env.new_string(text)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// List notebooks, one per line: `id \t title \t created_at`.
+#[no_mangle]
+pub extern "C" fn Java_jp_memorianotebook_Bridge_listNotebooks(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let result = with_state(|st| Ok(fmt_notebooks(st)));
+    string_result(&mut env, result)
+}
+
+/// List sources of notebook `nb`, one per line: `id \t title`.
+#[no_mangle]
+pub extern "C" fn Java_jp_memorianotebook_Bridge_listSources(
+    mut env: JNIEnv,
+    _class: JClass,
+    nb: jlong,
+) -> jstring {
+    let result = with_state(|st| Ok(fmt_sources(st, nb as u64)));
+    string_result(&mut env, result)
+}
+
+/// List chat turns of notebook `nb`, one per line:
+/// `role \t text \t cited chunk ids (comma-separated)`.
+#[no_mangle]
+pub extern "C" fn Java_jp_memorianotebook_Bridge_listTurns(
+    mut env: JNIEnv,
+    _class: JClass,
+    nb: jlong,
+) -> jstring {
+    let result = with_state(|st| fmt_turns(st, nb as u64));
+    string_result(&mut env, result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_state() -> (CoreState, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "nbapp-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let st = CoreState::new(&dir, EngineCfg::default(), "TinySwallow").unwrap();
+        (st, dir)
+    }
+
+    #[test]
+    fn esc_keeps_one_line() {
+        assert_eq!(esc("a\tb\nc\\d"), "a\\tb\\nc\\\\d");
+    }
+
+    #[test]
+    fn formats_list_notebooks_sources_and_turns() {
+        let (mut st, dir) = temp_state();
+        let nb = st.create_notebook("川辺\tの記録", 7).unwrap();
+        let src = st
+            .add_source(nb.id, SourceKind::Text, "天満川メモ", "", 0)
+            .unwrap();
+        let long = "南観音は天満川の西岸にある地区です。".repeat(30);
+        st.set_source_text(src.id, &long).unwrap();
+        let mut emb = BowEmbedder { dim: 64 };
+        st.index_source(src.id, &mut emb).unwrap();
+        let mut gen = CannedGenerator;
+        st.ask(nb.id, "南観音はどこですか", &mut emb, &mut gen, 5, 0)
+            .unwrap();
+
+        let nbs = fmt_notebooks(&st);
+        assert_eq!(nbs.lines().count(), 1);
+        assert!(nbs.starts_with(&format!("{}\t川辺\\tの記録\t7", nb.id)));
+
+        let srcs = fmt_sources(&st, nb.id);
+        assert_eq!(srcs, format!("{}\t天満川メモ", src.id));
+
+        let turns = fmt_turns(&st, nb.id).unwrap();
+        let lines: Vec<&str> = turns.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("user\t南観音はどこですか\t"));
+        assert!(lines[1].starts_with("assistant\t"));
+        // The canned answer cites a chunk, so the citation field is non-empty.
+        let cites = lines[1].rsplit('\t').next().unwrap();
+        assert!(!cites.is_empty(), "expected a cited chunk id: {lines:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
