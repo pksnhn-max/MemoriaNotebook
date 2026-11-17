@@ -6,6 +6,7 @@ import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 
 /**
@@ -97,6 +98,12 @@ public final class MainActivity extends Activity {
         answer = new TextView(this);
         root.addView(answer);
 
-        setContentView(root);
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(root);
+        setContentView(scroll);
+        // Keep the input field from grabbing focus (and panning the
+        // setup rows off-screen) at launch.
+        root.setFocusableInTouchMode(true);
+        root.requestFocus();
     }
 }
