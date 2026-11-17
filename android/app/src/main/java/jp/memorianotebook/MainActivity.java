@@ -293,18 +293,20 @@ public final class MainActivity extends Activity {
             buildCreateBar();
             return;
         }
-        // Two-column card grid, built as rows of two.
-        for (int i = 0; i < nbs.length; i += 2) {
+        // Card grid whose column count follows the screen width:
+        // a card is roughly 190dp wide, so wider screens get more
+        // columns and narrow ones fewer (2 minimum, 4 maximum).
+        // Cards share their row equally, so a lone card in the last
+        // row stretches to the full width instead of sitting at
+        // half size.
+        float widthDp = getResources().getDisplayMetrics().widthPixels
+                / getResources().getDisplayMetrics().density;
+        int cols = Math.max(2, Math.min(4, Math.round(widthDp / 190f)));
+        for (int i = 0; i < nbs.length; i += cols) {
             LinearLayout row = new LinearLayout(this);
             row.setOrientation(LinearLayout.HORIZONTAL);
-            row.addView(notebookCard(nbs[i]));
-            if (i + 1 < nbs.length) {
-                row.addView(notebookCard(nbs[i + 1]));
-            } else {
-                View spacer = new View(this);
-                spacer.setLayoutParams(new LinearLayout.LayoutParams(0,
-                        LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-                row.addView(spacer);
+            for (int j = i; j < Math.min(i + cols, nbs.length); j++) {
+                row.addView(notebookCard(nbs[j]));
             }
             screen.addView(row, matchWrap(12));
         }
@@ -317,7 +319,14 @@ public final class MainActivity extends Activity {
         if (!creating) {
             LinearLayout wrap = new LinearLayout(this);
             wrap.setGravity(Gravity.CENTER);
+            // The mock's floating pill is the strong tone (light in
+            // dark mode), not the hairline tone of inline buttons.
             Button pill = pillBtn("＋ 新規作成");
+            GradientDrawable sg = new GradientDrawable();
+            sg.setColor(ink);
+            sg.setCornerRadius(dp(20));
+            pill.setBackground(sg);
+            pill.setTextColor(ground);
             pill.setOnClickListener(new View.OnClickListener() {
                 @Override
                 public void onClick(View v) {
