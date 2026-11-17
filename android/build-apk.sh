@@ -38,12 +38,18 @@ cp dex/classes.dex .
 zip -q app-unsigned.apk classes.dex
 zip -q -0 app-unsigned.apk lib/arm64-v8a/libnotebook_app.so
 "$BT/zipalign" -f 4 app-unsigned.apk app-aligned.apk
-if [ ! -f "$W/debug.keystore" ]; then
-  keytool -genkeypair -keystore "$W/debug.keystore" -storepass android \
+# The debug key must be STABLE across builds, or Android refuses to
+# install a new build over the previous one. It therefore lives
+# outside the wiped work dir. (The first two 6a builds each used a
+# fresh key because the keystore sat inside $W — fixed 2026-11-17.)
+KEYSTORE="${KEYSTORE:-$HOME/.android/debug.keystore}"
+mkdir -p "$(dirname "$KEYSTORE")"
+if [ ! -f "$KEYSTORE" ]; then
+  keytool -genkeypair -keystore "$KEYSTORE" -storepass android \
     -keypass android -alias androiddebugkey -keyalg RSA -keysize 2048 \
     -validity 10000 -dname 'CN=Android Debug,O=Android,C=US'
 fi
-"$BT/apksigner" sign --ks "$W/debug.keystore" --ks-pass pass:android \
+"$BT/apksigner" sign --ks "$KEYSTORE" --ks-pass pass:android \
   --key-pass pass:android --out "$W/MemoriaNotebook-6a.apk" app-aligned.apk
 "$BT/apksigner" verify "$W/MemoriaNotebook-6a.apk"
 echo "APK: $W/MemoriaNotebook-6a.apk"
