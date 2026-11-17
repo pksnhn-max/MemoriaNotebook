@@ -8,6 +8,7 @@ import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.view.WindowInsets;
 
 /**
  * Stage 6a vessel: one Activity, no judgement. It only forwards
@@ -100,6 +101,22 @@ public final class MainActivity extends Activity {
 
         ScrollView scroll = new ScrollView(this);
         scroll.addView(root);
+        // targetSdk 36 draws edge-to-edge: without this, the top rows
+        // of the content slide under the status bar / action bar and
+        // are never visible (seen on device 2026-11-17: the status
+        // line and the setup button were hidden behind the bars).
+        scroll.setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {
+            @Override
+            public WindowInsets onApplyWindowInsets(View v, WindowInsets insets) {
+                int ab = getActionBar() != null ? getActionBar().getHeight() : 0;
+                v.setPadding(
+                        insets.getSystemWindowInsetLeft(),
+                        insets.getSystemWindowInsetTop() + ab,
+                        insets.getSystemWindowInsetRight(),
+                        insets.getSystemWindowInsetBottom());
+                return insets;
+            }
+        });
         setContentView(scroll);
         // Keep the input field from grabbing focus (and panning the
         // setup rows off-screen) at launch.
