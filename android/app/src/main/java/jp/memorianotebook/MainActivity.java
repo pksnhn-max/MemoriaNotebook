@@ -46,6 +46,9 @@ public final class MainActivity extends Activity {
     private int currentTab = 1; // 0 sources, 1 chat, 2 studio
     private int listFilter = 0; // 0 all, 1 mine, 2 shared, 3 downloaded
     private boolean creating = false;
+    private boolean searching = false;
+    private String searchQuery = "";
+    private LinearLayout gridBox;
 
     // ---------- small helpers ----------
 
@@ -241,22 +244,83 @@ public final class MainActivity extends Activity {
         currentNb = -1;
         clearScreen();
 
-        LinearLayout head = new LinearLayout(this);
-        head.setOrientation(LinearLayout.HORIZONTAL);
-        head.setGravity(Gravity.CENTER_VERTICAL);
-        TextView title = text("ノート", ssp(26), ink, false, true);
-        title.setLayoutParams(new LinearLayout.LayoutParams(
-                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        head.addView(title);
-        head.addView(text("⌕", 22, ink, false, false));
-        TextView dots = text("⋮", 22, ink, false, false);
-        LinearLayout.LayoutParams dp2 = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT);
-        dp2.leftMargin = dp(14);
-        dots.setLayoutParams(dp2);
-        head.addView(dots);
-        screen.addView(head);
+        if (searching) {
+            // Search mode: the header becomes the query field.
+            LinearLayout head = new LinearLayout(this);
+            head.setOrientation(LinearLayout.HORIZONTAL);
+            head.setGravity(Gravity.CENTER_VERTICAL);
+            final EditText q = new EditText(this);
+            q.setHint("ノートを検索（題名）");
+            q.setText(searchQuery);
+            q.setSelection(q.getText().length());
+            q.setTextColor(ink);
+            q.setHintTextColor(sub);
+            GradientDrawable qbg = new GradientDrawable();
+            qbg.setColor(surface);
+            qbg.setCornerRadius(sdp(20));
+            qbg.setStroke(1, hairline);
+            q.setBackground(qbg);
+            q.setPadding(sdp(14), sdp(8), sdp(14), sdp(8));
+            q.setLayoutParams(new LinearLayout.LayoutParams(
+                    0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+            q.addTextChangedListener(new android.text.TextWatcher() {
+                @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+                @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
+                @Override public void afterTextChanged(android.text.Editable s) {
+                    searchQuery = s.toString();
+                    fillGrid();
+                }
+            });
+            head.addView(q);
+            Button done = pillBtn("やめる");
+            LinearLayout.LayoutParams dp3 = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT);
+            dp3.leftMargin = dp(8);
+            done.setLayoutParams(dp3);
+            done.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    searching = false;
+                    searchQuery = "";
+                    showList();
+                }
+            });
+            head.addView(done);
+            screen.addView(head);
+            q.requestFocus();
+        } else {
+            LinearLayout head = new LinearLayout(this);
+            head.setOrientation(LinearLayout.HORIZONTAL);
+            head.setGravity(Gravity.CENTER_VERTICAL);
+            TextView title = text("ノート", ssp(26), ink, false, true);
+            title.setLayoutParams(new LinearLayout.LayoutParams(
+                    0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+            head.addView(title);
+            TextView searchBtn = text("⌕", ssp(22), ink, false, false);
+            searchBtn.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    searching = true;
+                    showList();
+                }
+            });
+            head.addView(searchBtn);
+            TextView dots = text("⋮", ssp(22), ink, false, false);
+            LinearLayout.LayoutParams dp2 = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT);
+            dp2.leftMargin = dp(14);
+            dots.setLayoutParams(dp2);
+            dots.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    openMenu();
+                }
+            });
+            head.addView(dots);
+            screen.addView(head);
+        }
 
         // Filter chips (nb1 v3): the real product's four categories.
         // This app has no sharing, so 共有 is always empty; everything
@@ -291,23 +355,41 @@ public final class MainActivity extends Activity {
         }
         screen.addView(chips, matchWrap(12));
 
+        gridBox = column();
+        screen.addView(gridBox, matchWrap(0));
+        fillGrid();
+        buildCreateBar();
+    }
+
+    /** (Re)build only the card grid — used by search keystrokes so
+     *  the query field keeps focus. */
+    private void fillGrid() {
+        if (gridBox == null) return;
+        gridBox.removeAllViews();
         String rawList = Bridge.listNotebooks();
         if (rawList != null && rawList.startsWith("ERR:")) {
-            screen.addView(text(rawList, 14, sub, false, false), matchWrap(14));
+            gridBox.addView(text(rawList, 14, sub, false, false), matchWrap(14));
         }
-        String[][] nbs = lines(rawList);
+        String[][] all = lines(rawList);
         if (listFilter == 2) {
-            TextView empty = text("共有されたノートはありません。",
-                    14, sub, false, false);
-            screen.addView(empty, matchWrap(18));
-            buildCreateBar();
+            gridBox.addView(text("共有されたノートはありません。",
+                    14, sub, false, false), matchWrap(18));
             return;
         }
-        if (nbs.length == 0) {
-            TextView empty = text("まだノートがありません。下の「＋ 新規作成」から作ってください。",
-                    14, sub, false, false);
-            screen.addView(empty, matchWrap(18));
-            buildCreateBar();
+        List<String[]> nbs = new ArrayList<>();
+        String query = searchQuery.trim().toLowerCase(Locale.JAPAN);
+        for (String[] rec : all) {
+            if (query.isEmpty()
+                    || (rec.length > 1
+                        && unesc(rec[1]).toLowerCase(Locale.JAPAN).contains(query))) {
+                nbs.add(rec);
+            }
+        }
+        if (nbs.isEmpty()) {
+            gridBox.addView(text(all.length == 0
+                    ? "まだノートがありません。下の「＋ 新規作成」から作ってください。"
+                    : "「" + searchQuery + "」に合うノートはありません。",
+                    14, sub, false, false), matchWrap(18));
             return;
         }
         // Card grid whose column count follows the screen width:
@@ -319,15 +401,84 @@ public final class MainActivity extends Activity {
         float widthDp = getResources().getDisplayMetrics().widthPixels
                 / getResources().getDisplayMetrics().density;
         int cols = Math.max(2, Math.min(4, Math.round(widthDp / 190f)));
-        for (int i = 0; i < nbs.length; i += cols) {
+        for (int i = 0; i < nbs.size(); i += cols) {
             LinearLayout row = new LinearLayout(this);
             row.setOrientation(LinearLayout.HORIZONTAL);
-            for (int j = i; j < Math.min(i + cols, nbs.length); j++) {
-                row.addView(notebookCard(nbs[j]));
+            for (int j = i; j < Math.min(i + cols, nbs.size()); j++) {
+                row.addView(notebookCard(nbs.get(j)));
             }
-            screen.addView(row, matchWrap(12));
+            gridBox.addView(row, matchWrap(12));
         }
-        buildCreateBar();
+    }
+
+    /** The ⋮ menu: settings (nb6 frame) and back to the top. */
+    private void openMenu() {
+        new android.app.AlertDialog.Builder(this)
+                .setItems(new String[]{"設定", "ノート一覧へ戻る"},
+                        new android.content.DialogInterface.OnClickListener() {
+                            @Override
+                            public void onClick(android.content.DialogInterface d, int w) {
+                                if (w == 0) showSettings();
+                                else showList();
+                            }
+                        })
+                .show();
+    }
+
+    /** nb6 settings frame with today's real state: the generation
+     *  seat and the local model are shown as they are; the API
+     *  fields get wired when the API seat lands. */
+    private void showSettings() {
+        searching = false;
+        clearScreen();
+        LinearLayout head = new LinearLayout(this);
+        head.setOrientation(LinearLayout.HORIZONTAL);
+        head.setGravity(Gravity.CENTER_VERTICAL);
+        TextView back = text("←", ssp(20), ink, false, false);
+        back.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showList();
+            }
+        });
+        head.addView(back);
+        TextView t = text("設定", ssp(19), ink, false, true);
+        LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        tp.leftMargin = dp(10);
+        t.setLayoutParams(tp);
+        head.addView(t);
+        screen.addView(head);
+
+        screen.addView(text("生成の座", 13, sub, false, true), matchWrap(16));
+        LinearLayout seat = column();
+        seat.setBackground(cardBg());
+        seat.setPadding(sdp(14), sdp(12), sdp(14), sdp(12));
+        seat.addView(text("● ローカル（既定）", 15, ink, false, true));
+        seat.addView(text("端末内のモデルで生成します。モデル本体は未導入です。",
+                12, sub, false, false));
+        seat.addView(text("○ API（任意）", 15, ink, false, false), matchWrap(10));
+        seat.addView(text("自分のエンドポイントとキーを差す席です。接続は次の更新で入ります。",
+                12, sub, false, false));
+        screen.addView(seat, matchWrap(8));
+
+        screen.addView(text("ローカルモデル", 13, sub, false, true), matchWrap(16));
+        LinearLayout model = column();
+        model.setBackground(cardBg());
+        model.setPadding(sdp(14), sdp(12), sdp(14), sdp(12));
+        model.addView(text("TinySwallow-1.5B-Instruct　［既定］", 15, ink, false, true));
+        model.addView(text("1.5B ・ Q4_K_M ・ 0.99 GB ・ コンテキスト 32,768 ・ 未導入",
+                12, sub, false, false));
+        screen.addView(model, matchWrap(8));
+
+        screen.addView(text("音声概要について", 13, sub, false, true), matchWrap(16));
+        LinearLayout audio = column();
+        audio.setBackground(cardBg());
+        audio.setPadding(sdp(14), sdp(12), sdp(14), sdp(12));
+        audio.addView(text("台本は API のモデルが書きます。ローカルモデルには書かせません。"
+                + "API 未設定のとき、生成は設定への案内を出して止まります。",
+                12, sub, false, false));
+        screen.addView(audio, matchWrap(8));
     }
 
     /** Bottom bar of the list screen (nb1 v3): a floating
@@ -486,7 +637,28 @@ public final class MainActivity extends Activity {
         tp.leftMargin = dp(10);
         t.setLayoutParams(tp);
         head.addView(t);
-        head.addView(text("⌕", 20, ink, false, false));
+        TextView nbSearch = text("⌕", ssp(20), ink, false, false);
+        nbSearch.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                searching = true;
+                showList();
+            }
+        });
+        head.addView(nbSearch);
+        TextView nbDots = text("⋮", ssp(20), ink, false, false);
+        LinearLayout.LayoutParams ndp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        ndp.leftMargin = dp(12);
+        nbDots.setLayoutParams(ndp);
+        nbDots.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                openMenu();
+            }
+        });
+        head.addView(nbDots);
         screen.addView(head);
 
         LinearLayout body = column();
