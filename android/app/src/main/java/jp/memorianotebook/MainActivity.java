@@ -108,13 +108,15 @@ public final class MainActivity extends Activity {
         scroll.setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {
             @Override
             public WindowInsets onApplyWindowInsets(View v, WindowInsets insets) {
-                int ab = getActionBar() != null ? getActionBar().getHeight() : 0;
+                // No ActionBar (theme), so only the system bars need
+                // padding. (Ultra's review, 2026-11-17: getActionBar()
+                // .getHeight() is 0 before layout — do not rely on it.)
                 v.setPadding(
                         insets.getSystemWindowInsetLeft(),
-                        insets.getSystemWindowInsetTop() + ab,
+                        insets.getSystemWindowInsetTop(),
                         insets.getSystemWindowInsetRight(),
                         insets.getSystemWindowInsetBottom());
-                return insets;
+                return insets.consumeSystemWindowInsets();
             }
         });
         setContentView(scroll);

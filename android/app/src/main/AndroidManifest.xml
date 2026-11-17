@@ -6,6 +6,7 @@
 
     <application
         android:label="MemoriaNotebook"
+        android:theme="@android:style/Theme.Material.NoActionBar"
         android:extractNativeLibs="true"
         android:hasCode="true">
         <activity
