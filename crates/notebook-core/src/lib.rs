@@ -169,6 +169,7 @@ pub enum CoreError {
     Json(serde_json::Error),
     NotebookNotFound(u64),
     SourceNotFound(u64),
+    GeneratorError(String),
 }
 
 impl From<io::Error> for CoreError {
@@ -190,6 +191,7 @@ impl std::fmt::Display for CoreError {
             CoreError::Json(e) => write!(f, "json: {e}"),
             CoreError::NotebookNotFound(id) => write!(f, "notebook not found: {id}"),
             CoreError::SourceNotFound(id) => write!(f, "source not found: {id}"),
+            CoreError::GeneratorError(msg) => write!(f, "generator: {msg}"),
         }
     }
 }
@@ -203,6 +205,14 @@ pub type CoreResult<T> = Result<T, CoreError>;
 pub trait Embedder {
     /// Embed a single text into a vector. The dimension is embedder-dependent.
     fn embed(&mut self, text: &str) -> CoreResult<Vec<f32>>;
+}
+
+/// 生成器トレイト。プロンプトを受け取り、生成されたテキストを返す。
+/// 実装は内部状態（会話履歴など）を持つことができるため `&mut self` を取る。
+pub trait Generator {
+    /// プロンプトからテキストを生成する。
+    /// エラー時は `CoreError` を返す。
+    fn generate(&mut self, prompt: &str) -> CoreResult<String>;
 }
 
 pub struct CoreState {
@@ -474,6 +484,68 @@ impl CoreState {
             scope.allowed_abs.insert(s.abs_path.clone());
         }
         scope
+    }
+
+    /// Ask one question against notebook `nb`: embed the question,
+    /// retrieve grounding chunks, build the citation-bound prompt,
+    /// generate, validate citations, and record both turns. On any
+    /// embedder or generator error nothing is recorded.
+    pub fn ask(
+        &mut self,
+        nb: u64,
+        question: &str,
+        embedder: &mut dyn Embedder,
+        generator: &mut dyn Generator,
+        top_k: usize,
+        at: u64,
+    ) -> CoreResult<ChatTurn> {
+        if !self.notebooks.iter().any(|n| n.id == nb) {
+            return Err(CoreError::NotebookNotFound(nb));
+        }
+        // 1. 質問を埋め込み
+        let qvec = embedder.embed(question)?;
+
+        // 2. 根拠を引く
+        let hits = self.search(nb, &qvec, top_k);
+
+        // 3. プロンプトを組む
+        let grounding = if hits.is_empty() {
+            "（該当する資料なし）".to_string()
+        } else {
+            format_grounding(&hits)
+        };
+
+        let prompt = format!(
+            "あなたはノートの資料だけに基づいて答えるアシスタントです。資料に無いことは「資料にありません」と答えてください。資料の各断片には [#番号] の印が付いています。主張の根拠にした断片の印を、文の末尾にそのまま書いてください。\n\n資料:\n{}\n\n質問:\n{}",
+            grounding, question
+        );
+
+        // 4. 生成
+        let generated_text = generator.generate(&prompt)?;
+
+        // 5. 検証（parse_citations）
+        let citations = parse_citations(&generated_text, &hits);
+
+        // 6. ターン記録（ユーザー → アシスタント）
+        let user_turn = ChatTurn {
+            nb,
+            role: Role::User,
+            text: question.to_string(),
+            citations: vec![],
+            at,
+        };
+        self.append_turn(&user_turn)?;
+
+        let assistant_turn = ChatTurn {
+            nb,
+            role: Role::Assistant,
+            text: generated_text,
+            citations,
+            at,
+        };
+        self.append_turn(&assistant_turn)?;
+
+        Ok(assistant_turn)
     }
 }
 
@@ -1295,4 +1367,143 @@ mod tests {
             assert_eq!(turns[0].citations[1].source_id, src_id);
         }
     }
+    // --- Stage 5: Generator seat / ask flow ---
+
+    struct RecordingGenerator {
+        captured: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    impl Generator for RecordingGenerator {
+        fn generate(&mut self, prompt: &str) -> CoreResult<String> {
+            *self.captured.lock().unwrap() = Some(prompt.to_string());
+            // Cite the first numeric [#n] marker found in the prompt,
+            // and mix in a bogus one that validation must drop.
+            let bytes = prompt.as_bytes();
+            let mut first: Option<u64> = None;
+            let mut i = 0;
+            while i + 2 < bytes.len() {
+                if bytes[i] == b'[' && bytes[i + 1] == b'#' {
+                    let mut j = i + 2;
+                    let mut num = String::new();
+                    while j < bytes.len() && bytes[j].is_ascii_digit() {
+                        num.push(bytes[j] as char);
+                        j += 1;
+                    }
+                    if j < bytes.len() && bytes[j] == b']' && !num.is_empty() {
+                        first = num.parse().ok();
+                        break;
+                    }
+                    i = j;
+                } else {
+                    i += 1;
+                }
+            }
+            match first {
+                Some(id) => Ok(format!("答えです[#{id}]。無い印[#9999]も混ぜる。")),
+                None => Ok("資料にありません。".to_string()),
+            }
+        }
+    }
+
+    struct FixedGenerator(&'static str);
+
+    impl Generator for FixedGenerator {
+        fn generate(&mut self, _prompt: &str) -> CoreResult<String> {
+            Ok(self.0.to_string())
+        }
+    }
+
+    struct ErrorGenerator;
+
+    impl Generator for ErrorGenerator {
+        fn generate(&mut self, _prompt: &str) -> CoreResult<String> {
+            Err(CoreError::GeneratorError("boom".into()))
+        }
+    }
+
+    fn ask_fixture(dir: &std::path::Path) -> (CoreState, u64, u64) {
+        let mut st = CoreState::new(dir, EngineCfg::default(), "m").unwrap();
+        let nb = st.create_notebook("NB", 1).unwrap();
+        let src = st.add_source(nb.id, SourceKind::Text, "s", "/s.txt", 2).unwrap();
+        st.set_source_text(
+            src.id,
+            &format!(
+                "{}\n\n{}",
+                "猫 は 魚 が 好き 。 ".repeat(40),
+                "犬 は 公園 で 走る 。 ".repeat(40)
+            ),
+        )
+        .unwrap();
+        let mut emb = FakeEmbedder::new(32);
+        st.index_source(src.id, &mut emb).unwrap();
+        (st, nb.id, src.id)
+    }
+
+    #[test]
+    fn ask_roundtrip_records_cited_turn() {
+        let dir = temp_dir();
+        let (mut st, nb_id, src_id) = ask_fixture(&dir);
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut gen = RecordingGenerator { captured: captured.clone() };
+        let mut emb = FakeEmbedder::new(32);
+        let turn = st.ask(nb_id, "猫 魚", &mut emb, &mut gen, 2, 10).unwrap();
+        assert_eq!(turn.role, Role::Assistant);
+        // The bogus [#9999] marker must have been dropped.
+        assert_eq!(turn.citations.len(), 1);
+        assert_eq!(turn.citations[0].source_id, src_id);
+        let top = st.search(nb_id, &emb.embed("猫 魚").unwrap(), 1);
+        assert_eq!(turn.citations[0].chunk_id, Some(top[0].0.id));
+        let turns = st.turns_of(nb_id).unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].role, Role::User);
+        drop(st);
+        let st2 = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+        assert_eq!(st2.turns_of(nb_id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn ask_drops_unknown_markers() {
+        let dir = temp_dir();
+        let (mut st, nb_id, _) = ask_fixture(&dir);
+        let mut gen = FixedGenerator("答え[#9999]だけ。");
+        let mut emb = FakeEmbedder::new(32);
+        let turn = st.ask(nb_id, "猫 魚", &mut emb, &mut gen, 2, 10).unwrap();
+        assert!(turn.citations.is_empty());
+    }
+
+    #[test]
+    fn ask_without_grounding_still_answers() {
+        let dir = temp_dir();
+        let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+        let nb = st.create_notebook("EMPTY", 1).unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut gen = RecordingGenerator { captured: captured.clone() };
+        let mut emb = FakeEmbedder::new(32);
+        let turn = st.ask(nb.id, "何か", &mut emb, &mut gen, 3, 10).unwrap();
+        assert!(turn.citations.is_empty());
+        let prompt = captured.lock().unwrap().clone().unwrap();
+        assert!(prompt.contains("（該当する資料なし）"));
+    }
+
+    #[test]
+    fn ask_generator_error_records_nothing() {
+        let dir = temp_dir();
+        let (mut st, nb_id, _) = ask_fixture(&dir);
+        let mut gen = ErrorGenerator;
+        let mut emb = FakeEmbedder::new(32);
+        let r = st.ask(nb_id, "猫 魚", &mut emb, &mut gen, 2, 10);
+        assert!(matches!(r, Err(CoreError::GeneratorError(_))));
+        assert_eq!(st.turns_of(nb_id).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn ask_missing_notebook_fails() {
+        let dir = temp_dir();
+        let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+        let mut gen = FixedGenerator("x");
+        let mut emb = FakeEmbedder::new(32);
+        let r = st.ask(999, "q", &mut emb, &mut gen, 2, 10);
+        assert!(matches!(r, Err(CoreError::NotebookNotFound(999))));
+    }
+
 }
