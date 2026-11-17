@@ -44,6 +44,8 @@ public final class MainActivity extends Activity {
     private long currentNb = -1;
     private String currentTitle = "";
     private int currentTab = 1; // 0 sources, 1 chat, 2 studio
+    private int listFilter = 0; // 0 all, 1 mine, 2 shared, 3 downloaded
+    private boolean creating = false;
 
     // ---------- small helpers ----------
 
@@ -113,7 +115,7 @@ public final class MainActivity extends Activity {
 
     private String dateOf(long unixSec) {
         if (unixSec <= 0) return "";
-        return new SimpleDateFormat("M月d日", Locale.JAPAN)
+        return new SimpleDateFormat("yyyy年M月d日", Locale.JAPAN)
                 .format(new Date(unixSec * 1000L));
     }
 
@@ -239,47 +241,56 @@ public final class MainActivity extends Activity {
         head.addView(dots);
         screen.addView(head);
 
-        TextView tabs = text("すべて    最近    ダウンロード済み", 14, sub, false, false);
-        screen.addView(tabs, matchWrap(14));
-
-        // New-notebook row (the mock's "＋ 新しいノートを作成" card):
-        // one row — title field and a small create pill side by side.
-        LinearLayout createCard = new LinearLayout(this);
-        createCard.setOrientation(LinearLayout.HORIZONTAL);
-        createCard.setGravity(Gravity.CENTER_VERTICAL);
-        createCard.setBackground(cardBg());
-        createCard.setPadding(dp(14), dp(6), dp(10), dp(6));
-        final EditText newTitle = new EditText(this);
-        newTitle.setHint("＋ 新しいノートを作成");
-        newTitle.setTextColor(ink);
-        newTitle.setHintTextColor(sub);
-        newTitle.setBackgroundColor(Color.TRANSPARENT);
-        newTitle.setLayoutParams(new LinearLayout.LayoutParams(
-                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        createCard.addView(newTitle);
-        Button createBtn = pillBtn("作成");
-        createBtn.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                String t = newTitle.getText().toString().trim();
-                if (t.isEmpty()) t = "無題のノート";
-                long id = Bridge.createNotebook(t, System.currentTimeMillis() / 1000L);
-                if (id >= 0) showNotebook(id, t, 1);
-                else showList();
-            }
-        });
-        createCard.addView(createBtn);
-        screen.addView(createCard, matchWrap(14));
+        // Filter chips (nb1 v3): the real product's four categories.
+        // This app has no sharing, so 共有 is always empty; everything
+        // is on-device, so マイノートブック / ダウンロード済み coincide
+        // with すべて for now.
+        LinearLayout chips = new LinearLayout(this);
+        chips.setOrientation(LinearLayout.HORIZONTAL);
+        String[] chipLabels = {"すべて", "マイノートブック", "共有", "ダウンロード済み"};
+        for (int i = 0; i < chipLabels.length; i++) {
+            final int idx = i;
+            boolean on = i == listFilter;
+            TextView chip = text(chipLabels[i], 12.5f, on ? ground : sub, false, on);
+            GradientDrawable cg = new GradientDrawable();
+            cg.setColor(on ? ink : Color.TRANSPARENT);
+            cg.setCornerRadius(dp(16));
+            if (!on) cg.setStroke(1, hairline);
+            chip.setBackground(cg);
+            chip.setPadding(dp(11), dp(6), dp(11), dp(6));
+            LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT);
+            if (i > 0) cp.leftMargin = dp(7);
+            chip.setLayoutParams(cp);
+            chip.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    listFilter = idx;
+                    showList();
+                }
+            });
+            chips.addView(chip);
+        }
+        screen.addView(chips, matchWrap(12));
 
         String rawList = Bridge.listNotebooks();
         if (rawList != null && rawList.startsWith("ERR:")) {
             screen.addView(text(rawList, 14, sub, false, false), matchWrap(14));
         }
         String[][] nbs = lines(rawList);
-        if (nbs.length == 0) {
-            TextView empty = text("まだノートがありません。上の欄から作ってください。",
+        if (listFilter == 2) {
+            TextView empty = text("共有されたノートはありません。",
                     14, sub, false, false);
             screen.addView(empty, matchWrap(18));
+            buildCreateBar();
+            return;
+        }
+        if (nbs.length == 0) {
+            TextView empty = text("まだノートがありません。下の「＋ 新規作成」から作ってください。",
+                    14, sub, false, false);
+            screen.addView(empty, matchWrap(18));
+            buildCreateBar();
             return;
         }
         // Two-column card grid, built as rows of two.
@@ -297,6 +308,76 @@ public final class MainActivity extends Activity {
             }
             screen.addView(row, matchWrap(12));
         }
+        buildCreateBar();
+    }
+
+    /** Bottom bar of the list screen (nb1 v3): a floating
+     *  "＋ 新規作成" pill; tapped, it opens the title field in place. */
+    private void buildCreateBar() {
+        if (!creating) {
+            LinearLayout wrap = new LinearLayout(this);
+            wrap.setGravity(Gravity.CENTER);
+            Button pill = pillBtn("＋ 新規作成");
+            pill.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    creating = true;
+                    showList();
+                }
+            });
+            wrap.addView(pill);
+            bottomBar.addView(wrap);
+            return;
+        }
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        final EditText newTitle = new EditText(this);
+        newTitle.setHint("ノートのタイトル");
+        newTitle.setTextColor(ink);
+        newTitle.setHintTextColor(sub);
+        GradientDrawable fieldBg = new GradientDrawable();
+        fieldBg.setColor(surface);
+        fieldBg.setCornerRadius(dp(20));
+        fieldBg.setStroke(1, hairline);
+        newTitle.setBackground(fieldBg);
+        newTitle.setPadding(dp(14), dp(8), dp(14), dp(8));
+        newTitle.setLayoutParams(new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        row.addView(newTitle);
+        Button createBtn = pillBtn("作成");
+        LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        bp.leftMargin = dp(8);
+        createBtn.setLayoutParams(bp);
+        createBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                String t = newTitle.getText().toString().trim();
+                if (t.isEmpty()) t = "無題のノート";
+                creating = false;
+                long id = Bridge.createNotebook(t, System.currentTimeMillis() / 1000L);
+                if (id >= 0) showNotebook(id, t, 1);
+                else showList();
+            }
+        });
+        row.addView(createBtn);
+        Button cancelBtn = pillBtn("やめる");
+        LinearLayout.LayoutParams cp2 = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        cp2.leftMargin = dp(8);
+        cancelBtn.setLayoutParams(cp2);
+        cancelBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                creating = false;
+                showList();
+            }
+        });
+        row.addView(cancelBtn);
+        bottomBar.addView(row);
     }
 
     private View notebookCard(final String[] rec) {
@@ -317,7 +398,7 @@ public final class MainActivity extends Activity {
 
         TextView t = text(title, 16, ink, true, true);
         card.addView(t);
-        String meta = srcCount + " ソース"
+        String meta = srcCount + " 件のソース"
                 + (created.equals("0") ? "" : " ・ " + dateOf(Long.parseLong(created)));
         TextView m = text(meta, 12, sub, false, false);
         LinearLayout.LayoutParams mp = new LinearLayout.LayoutParams(
@@ -359,6 +440,7 @@ public final class MainActivity extends Activity {
         currentNb = id;
         currentTitle = title;
         currentTab = tab;
+        creating = false;
         clearScreen();
 
         LinearLayout head = new LinearLayout(this);
@@ -429,7 +511,7 @@ public final class MainActivity extends Activity {
         card.setBackground(cardBg());
         card.setPadding(dp(14), dp(12), dp(14), dp(12));
         card.addView(text(currentTitle, 18, ink, true, true));
-        TextView meta = text(srcCount + " ソース", 12, sub, false, false);
+        TextView meta = text(srcCount + " 件のソース", 12, sub, false, false);
         card.addView(meta);
         if (srcCount > 0) {
             StringBuilder names = new StringBuilder("資料：");
