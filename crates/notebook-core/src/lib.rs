@@ -22,9 +22,9 @@
 //! or an external lock). It is not internally synchronized.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 /// Which seat generates chat replies.
@@ -198,6 +198,13 @@ impl std::error::Error for CoreError {}
 
 pub type CoreResult<T> = Result<T, CoreError>;
 
+/// Trait for text embedders. The real ONNX embedder lives in the host
+/// app; this crate only needs the trait and a deterministic fake for tests.
+pub trait Embedder {
+    /// Embed a single text into a vector. The dimension is embedder-dependent.
+    fn embed(&mut self, text: &str) -> CoreResult<Vec<f32>>;
+}
+
 pub struct CoreState {
     data_dir: PathBuf,
     cfg: EngineCfg,
@@ -208,6 +215,9 @@ pub struct CoreState {
     /// at load).
     chunks: Vec<ChunkRec>,
     chunk_rev: BTreeMap<u64, u64>,
+    /// Embedding vectors for chunks that have been indexed.
+    /// chunk_id -> vector (f32)
+    embeddings: HashMap<u64, Vec<f32>>,
     next_notebook_id: u64,
     next_source_id: u64,
     next_chunk_id: u64,
@@ -237,6 +247,10 @@ impl CoreState {
             .into_iter()
             .filter(|c| chunk_rev.get(&c.source_id) == Some(&c.rev))
             .collect();
+
+        // Load embedding sidecar.
+        let embeddings = load_embeddings(&data_dir.join("emb_chunks.bin"), &chunks)?;
+
         Ok(CoreState {
             data_dir: data_dir.to_path_buf(),
             cfg,
@@ -245,6 +259,7 @@ impl CoreState {
             sources,
             chunks,
             chunk_rev,
+            embeddings,
             next_notebook_id,
             next_source_id,
             next_chunk_id,
@@ -335,6 +350,16 @@ impl CoreState {
             self.next_chunk_id += 1;
             made.push(rec);
         }
+        // Remove old chunks and their embeddings.
+        let old_chunk_ids: Vec<u64> = self
+            .chunks
+            .iter()
+            .filter(|c| c.source_id == source_id)
+            .map(|c| c.id)
+            .collect();
+        for id in old_chunk_ids {
+            self.embeddings.remove(&id);
+        }
         self.chunks.retain(|c| c.source_id != source_id);
         self.chunks.extend(made.iter().cloned());
         self.chunk_rev.insert(source_id, rev);
@@ -350,6 +375,86 @@ impl CoreState {
             .collect();
         v.sort_by_key(|c| c.ord);
         v
+    }
+
+    /// Embed all current chunks of `source_id` using `embedder`, append
+    /// vectors to the sidecar, and keep them in memory. Returns the
+    /// number of chunks embedded.
+    pub fn index_source(
+        &mut self,
+        source_id: u64,
+        embedder: &mut dyn Embedder,
+    ) -> CoreResult<usize> {
+        if !self.sources.iter().any(|s| s.id == source_id) {
+            return Err(CoreError::SourceNotFound(source_id));
+        }
+        let chunks: Vec<(u64, String)> = self
+            .chunks_of(source_id)
+            .into_iter()
+            .map(|c| (c.id, c.text.clone()))
+            .collect();
+        if chunks.is_empty() {
+            return Ok(0);
+        }
+        let path = self.data_dir.join("emb_chunks.bin");
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut count = 0;
+        for (chunk_id, chunk_text) in chunks {
+            let vec = embedder.embed(&chunk_text)?;
+            // Write record: chunk_id (u64 LE), dim (u32 LE), f32[dim] LE
+            file.write_all(&chunk_id.to_le_bytes())?;
+            let dim = vec.len() as u32;
+            file.write_all(&dim.to_le_bytes())?;
+            for v in &vec {
+                file.write_all(&v.to_le_bytes())?;
+            }
+            file.flush()?;
+            self.embeddings.insert(chunk_id, vec);
+            count += 1;
+        }
+        file.sync_all()?;
+        Ok(count)
+    }
+
+    /// Search within notebook `nb` for chunks similar to `query` vector.
+    /// Only considers chunks belonging to `nb` that have an embedding
+    /// of matching dimension. Returns top_k (chunk, cosine_similarity)
+    /// sorted by similarity descending, then chunk_id ascending.
+    pub fn search(
+        &self,
+        nb: u64,
+        query: &[f32],
+        top_k: usize,
+    ) -> Vec<(ChunkRec, f32)> {
+        if query.is_empty() || top_k == 0 {
+            return Vec::new();
+        }
+        let query_norm = l2_norm(query);
+        if query_norm == 0.0 {
+            return Vec::new();
+        }
+        let mut results = Vec::new();
+        for chunk in self.chunks.iter().filter(|c| c.nb == nb) {
+            if let Some(vec) = self.embeddings.get(&chunk.id) {
+                if vec.len() != query.len() {
+                    continue;
+                }
+                let vec_norm = l2_norm(vec);
+                if vec_norm == 0.0 {
+                    continue;
+                }
+                let dot: f32 = query.iter().zip(vec.iter()).map(|(a, b)| a * b).sum();
+                let sim = dot / (query_norm * vec_norm);
+                results.push((chunk.clone(), sim));
+            }
+        }
+        results.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.id.cmp(&b.0.id))
+        });
+        results.truncate(top_k);
+        results
     }
 
     pub fn append_turn(&self, turn: &ChatTurn) -> CoreResult<()> {
@@ -466,6 +571,48 @@ fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> CoreResult<Vec<T>> {
     Ok(out)
 }
 
+/// Load embeddings from the binary sidecar. Returns a map of chunk_id -> vector.
+/// Only keeps vectors for chunk_ids that exist in `current_chunks`.
+/// Stops reading at the first truncated/corrupted record.
+fn load_embeddings(
+    path: &Path,
+    current_chunks: &[ChunkRec],
+) -> CoreResult<HashMap<u64, Vec<f32>>> {
+    let mut map = HashMap::new();
+    if !path.exists() {
+        return Ok(map);
+    }
+    let mut file = fs::File::open(path)?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    let mut pos = 0;
+    let valid_ids: std::collections::HashSet<u64> = current_chunks.iter().map(|c| c.id).collect();
+    while pos + 8 + 4 <= buf.len() {
+        let chunk_id = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        let dim = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        if pos + dim * 4 > buf.len() {
+            // Truncated record; stop here.
+            break;
+        }
+        let mut vec = Vec::with_capacity(dim);
+        for _ in 0..dim {
+            let v = f32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            vec.push(v);
+        }
+        if valid_ids.contains(&chunk_id) {
+            map.insert(chunk_id, vec);
+        }
+    }
+    Ok(map)
+}
+
+fn l2_norm(v: &[f32]) -> f32 {
+    v.iter().map(|x| x * x).sum::<f32>().sqrt()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,6 +625,41 @@ mod tests {
         let d = std::env::temp_dir().join(format!("nbcore-{}-{n}", std::process::id()));
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    // Deterministic fake embedder: hash each word, use as seed for a simple PRNG.
+    struct FakeEmbedder {
+        dim: usize,
+    }
+
+    impl FakeEmbedder {
+        fn new(dim: usize) -> Self {
+            Self { dim }
+        }
+    }
+
+    impl Embedder for FakeEmbedder {
+        fn embed(&mut self, text: &str) -> CoreResult<Vec<f32>> {
+            // Bag-of-words feature hashing: each word votes into one
+            // dimension, so texts sharing words get similar vectors.
+            let mut vec = vec![0.0f32; self.dim];
+            for word in text.split_whitespace() {
+                let mut h: u64 = 0xcbf29ce484222325;
+                for b in word.as_bytes() {
+                    h ^= *b as u64;
+                    h = h.wrapping_mul(0x100000001b3);
+                }
+                vec[(h % self.dim as u64) as usize] += 1.0;
+            }
+            // Normalize
+            let norm = l2_norm(&vec);
+            if norm > 0.0 {
+                for v in &mut vec {
+                    *v /= norm;
+                }
+            }
+            Ok(vec)
+        }
     }
 
     #[test]
@@ -710,6 +892,211 @@ mod tests {
             assert_eq!(srcs, vec![1, 2]);
             let turns: Vec<ChatTurn> = read_jsonl(&dir.join("turns.jsonl")).unwrap();
             assert_eq!(turns.len(), 2);
+        }
+    }
+
+    // --- New embedding / search tests ---
+
+    #[test]
+    fn index_and_search_returns_target_chunk_first() {
+        let dir = temp_dir();
+        let (nb_id, src_id, chunk_ids) = {
+            let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+            let nb = st.create_notebook("NB", 1).unwrap();
+            let src = st.add_source(nb.id, SourceKind::Text, "src", "/s.txt", 2).unwrap();
+            let made = st.set_source_text(src.id, &format!("{}\n\n{}", "りんご みかん ばなな ".repeat(25), "さくら もみじ いちょう ".repeat(25))).unwrap();
+            assert_eq!(made.len(), 2);
+            (nb.id, src.id, made.iter().map(|c| c.id).collect::<Vec<_>>())
+        };
+        {
+            let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+            let mut embedder = FakeEmbedder::new(32);
+            let count = st.index_source(src_id, &mut embedder).unwrap();
+            assert_eq!(count, 2);
+
+            // Query with text similar to first chunk
+            let query_vec = embedder.embed("りんご みかん").unwrap();
+            let results = st.search(nb_id, &query_vec, 2);
+            assert_eq!(results.len(), 2);
+            // First chunk should be top
+            assert_eq!(results[0].0.id, chunk_ids[0]);
+            assert!(results[0].1 > results[1].1);
+        }
+    }
+
+    #[test]
+    fn search_scoped_to_notebook_excludes_other_notebook() {
+        let dir = temp_dir();
+        let (nb1_id, nb2_id, src1_id, src2_id) = {
+            let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+            let nb1 = st.create_notebook("NB1", 1).unwrap();
+            let nb2 = st.create_notebook("NB2", 2).unwrap();
+            let src1 = st.add_source(nb1.id, SourceKind::Text, "s1", "/s1.txt", 3).unwrap();
+            let src2 = st.add_source(nb2.id, SourceKind::Text, "s2", "/s2.txt", 4).unwrap();
+            st.set_source_text(src1.id, "共通 キーワード だけ").unwrap();
+            st.set_source_text(src2.id, "共通 キーワード だけ").unwrap();
+            (nb1.id, nb2.id, src1.id, src2.id)
+        };
+        {
+            let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+            let mut embedder = FakeEmbedder::new(32);
+            st.index_source(src1_id, &mut embedder).unwrap();
+            st.index_source(src2_id, &mut embedder).unwrap();
+
+            let query_vec = embedder.embed("共通 キーワード").unwrap();
+            // Search in NB1 should only return NB1's chunk
+            let results1 = st.search(nb1_id, &query_vec, 5);
+            assert_eq!(results1.len(), 1);
+            assert_eq!(results1[0].0.nb, nb1_id);
+
+            // Search in NB2 should only return NB2's chunk
+            let results2 = st.search(nb2_id, &query_vec, 5);
+            assert_eq!(results2.len(), 1);
+            assert_eq!(results2[0].0.nb, nb2_id);
+        }
+    }
+
+    #[test]
+    fn embeddings_survive_reload() {
+        let dir = temp_dir();
+        let (nb_id, src_id, chunk_id) = {
+            let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+            let nb = st.create_notebook("NB", 1).unwrap();
+            let src = st.add_source(nb.id, SourceKind::Text, "s", "/s.txt", 2).unwrap();
+            let made = st.set_source_text(src.id, "持続 する ベクトル").unwrap();
+            let mut embedder = FakeEmbedder::new(16);
+            st.index_source(src.id, &mut embedder).unwrap();
+            (nb.id, src.id, made[0].id)
+        };
+        // Reload
+        {
+            let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+            let mut embedder = FakeEmbedder::new(16);
+            let query_vec = embedder.embed("持続 する ベクトル").unwrap();
+            let results = st.search(nb_id, &query_vec, 1);
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].0.id, chunk_id);
+            assert!(results[0].1 > 0.9); // high similarity since same embedder
+        }
+    }
+
+    #[test]
+    fn rechunk_removes_old_chunks_from_search() {
+        let dir = temp_dir();
+        let (nb_id, src_id) = {
+            let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+            let nb = st.create_notebook("NB", 1).unwrap();
+            let src = st.add_source(nb.id, SourceKind::Text, "s", "/s.txt", 2).unwrap();
+            st.set_source_text(src.id, "古い テキスト だけ").unwrap();
+            let mut embedder = FakeEmbedder::new(16);
+            st.index_source(src.id, &mut embedder).unwrap();
+            (nb.id, src.id)
+        };
+        // Re-chunk with new text
+        {
+            let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+            let new_text = "完全 に 新しい 文章 です";
+            st.set_source_text(src_id, new_text).unwrap();
+            let mut embedder = FakeEmbedder::new(16);
+            st.index_source(src_id, &mut embedder).unwrap();
+
+            // Search with old text should not match well
+            let old_query = embedder.embed("古い テキスト").unwrap();
+            let results = st.search(nb_id, &old_query, 5);
+            // New chunks exist but similarity should be low
+            assert!(!results.is_empty());
+            // The top result should be from new text (only chunks available)
+            // but similarity should be low since content differs
+            assert!(results[0].1 < 0.5);
+        }
+        // Reload and verify old chunks are gone
+        {
+            let st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+            let chunks = st.chunks_of(src_id);
+            assert_eq!(chunks.len(), 1);
+            assert_eq!(chunks[0].text, "完全 に 新しい 文章 です");
+        }
+    }
+
+    #[test]
+    fn index_source_missing_source_fails() {
+        let dir = temp_dir();
+        let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+        let mut embedder = FakeEmbedder::new(8);
+        let r = st.index_source(999, &mut embedder);
+        assert!(matches!(r, Err(CoreError::SourceNotFound(999))));
+    }
+
+    #[test]
+    fn search_handles_dimension_mismatch_gracefully() {
+        let dir = temp_dir();
+        let (nb_id, src_id) = {
+            let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+            let nb = st.create_notebook("NB", 1).unwrap();
+            let src = st.add_source(nb.id, SourceKind::Text, "s", "/s.txt", 2).unwrap();
+            st.set_source_text(src.id, "テスト").unwrap();
+            let mut embedder = FakeEmbedder::new(16);
+            st.index_source(src.id, &mut embedder).unwrap();
+            (nb.id, src.id)
+        };
+        // Reload with different dimension embedder (should not crash, just skip)
+        {
+            let st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+            // Query with different dimension (32 vs stored 16)
+            let query_vec = vec![0.1f32; 32];
+            let results = st.search(nb_id, &query_vec, 5);
+            // Should return empty because dimension mismatch skips the chunk
+            assert!(results.is_empty());
+        }
+    }
+
+    #[test]
+    fn search_empty_query_returns_empty() {
+        let dir = temp_dir();
+        let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+        let nb = st.create_notebook("NB", 1).unwrap();
+        let src = st.add_source(nb.id, SourceKind::Text, "s", "/s.txt", 2).unwrap();
+        st.set_source_text(src.id, "テスト").unwrap();
+        let mut embedder = FakeEmbedder::new(16);
+        st.index_source(src.id, &mut embedder).unwrap();
+
+        let results = st.search(nb.id, &[], 5);
+        assert!(results.is_empty());
+
+        let results = st.search(nb.id, &[0.1, 0.2], 0);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_sorts_by_similarity_then_chunk_id() {
+        let dir = temp_dir();
+        let (nb_id, chunk_ids) = {
+            let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+            let nb = st.create_notebook("NB", 1).unwrap();
+            let src = st.add_source(nb.id, SourceKind::Text, "s", "/s.txt", 2).unwrap();
+            // Create 3 chunks with distinct content
+            let made = st.set_source_text(src.id, &format!("{}\n\n{}\n\n{}", "aaa ".repeat(150), "bbb ".repeat(150), "ccc ".repeat(150))).unwrap();
+            let mut embedder = FakeEmbedder::new(16);
+            st.index_source(src.id, &mut embedder).unwrap();
+            (nb.id, made.iter().map(|c| c.id).collect::<Vec<_>>())
+        };
+        {
+            let st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+            // Query matches all similarly (fake embedder produces similar vectors for similar words)
+            // But we can test tie-breaking by chunk_id with a query that gives equal similarity
+            // Since fake embedder is deterministic, we just verify ordering is stable
+            let mut embedder = FakeEmbedder::new(16);
+            let query = embedder.embed("aaa bbb ccc").unwrap();
+            let results = st.search(nb_id, &query, 10);
+            assert_eq!(results.len(), 3);
+            // Results should be sorted by similarity desc, then chunk_id asc
+            for i in 1..results.len() {
+                if (results[i-1].1 - results[i].1).abs() < 1e-6 {
+                    assert!(results[i-1].0.id < results[i].0.id);
+                } else {
+                    assert!(results[i-1].1 >= results[i].1);
+                }
+            }
         }
     }
 }

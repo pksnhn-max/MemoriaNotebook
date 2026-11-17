@@ -18,5 +18,7 @@ Memoria の部品で組み、端末で完結させる Android アプリの試作
 
 - `crates/notebook-core`：核の土台。`CoreState` の界面と記録層
   （`notebooks.jsonl`／`sources.jsonl`／`turns.jsonl`）＋チャンク側車
-  （`chunks.jsonl`、段落単位・約400字、版管理付き）。出典はチャンクIDを
-  運べる形になった。埋め込み側車と検索・推論の接続は後段。
+  （`chunks.jsonl`、段落単位・約400字、版管理付き）＋埋め込み側車
+  （`emb_chunks.bin`）とノート範囲に絞ったコサイン検索。埋め込み器は
+  トレイトで差し替え可能（実モデルは後段でホスト側が差す）。
+  推論の接続は後段。
