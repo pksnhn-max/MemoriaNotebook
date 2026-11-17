@@ -82,11 +82,19 @@ fn esc(s: &str) -> String {
         .replace('\n', "\\n")
 }
 
-/// One line per notebook: `id \t title \t created_at`.
+/// One line per notebook: `id \t title \t created_at \t source count`.
 fn fmt_notebooks(st: &CoreState) -> String {
     st.notebooks()
         .iter()
-        .map(|n| format!("{}\t{}\t{}", n.id, esc(&n.title), n.created_at))
+        .map(|n| {
+            format!(
+                "{}\t{}\t{}\t{}",
+                n.id,
+                esc(&n.title),
+                n.created_at,
+                st.sources_of(n.id).len()
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -157,19 +165,21 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_init(
     }
 }
 
-/// Create a notebook; returns its id, or -1 on failure.
+/// Create a notebook at `now` (unix seconds, supplied by the host
+/// clock); returns its id, or -1 on failure.
 #[no_mangle]
 pub extern "C" fn Java_jp_memorianotebook_Bridge_createNotebook(
     mut env: JNIEnv,
     _class: JClass,
     title: JString,
+    now: jlong,
 ) -> jlong {
     let title = match jstring_to_string(&mut env, &title) {
         Ok(t) => t,
         Err(_) => return -1,
     };
     with_state(|st| {
-        let nb = st.create_notebook(&title, 0)?;
+        let nb = st.create_notebook(&title, now.max(0) as u64)?;
         Ok(nb.id as jlong)
     })
     .unwrap_or(-1)
@@ -246,7 +256,7 @@ fn string_result(env: &mut JNIEnv, result: Result<String, String>) -> jstring {
         .unwrap_or(std::ptr::null_mut())
 }
 
-/// List notebooks, one per line: `id \t title \t created_at`.
+/// List notebooks, one per line: `id \t title \t created_at \t source count`.
 #[no_mangle]
 pub extern "C" fn Java_jp_memorianotebook_Bridge_listNotebooks(
     mut env: JNIEnv,
@@ -317,7 +327,7 @@ mod tests {
 
         let nbs = fmt_notebooks(&st);
         assert_eq!(nbs.lines().count(), 1);
-        assert!(nbs.starts_with(&format!("{}\t川辺\\tの記録\t7", nb.id)));
+        assert!(nbs.starts_with(&format!("{}\t川辺\\tの記録\t7\t1", nb.id)));
 
         let srcs = fmt_sources(&st, nb.id);
         assert_eq!(srcs, format!("{}\t天満川メモ", src.id));

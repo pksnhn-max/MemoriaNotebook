@@ -10,10 +10,10 @@ public final class Bridge {
     private Bridge() {}
 
     public static native boolean init(String dataDir);
-    public static native long createNotebook(String title);
+    public static native long createNotebook(String title, long nowSeconds);
     public static native long addTextSource(long notebookId, String title, String text);
     public static native String ask(long notebookId, String question);
-    /** One line per notebook: id \t title \t created_at. */
+    /** One line per notebook: id \t title \t created_at \t source count. */
     public static native String listNotebooks();
     /** One line per source: id \t title. */
     public static native String listSources(long notebookId);
