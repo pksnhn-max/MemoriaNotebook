@@ -199,6 +199,64 @@ fn get_text(url: &str, cap: usize) -> Result<String, NetError> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// GET `url` with custom `headers`, reading the body up to `cap` bytes.
+/// Header values and the request body are never included in error messages.
+pub fn get_with_headers(url: &str, headers: &[(&str, &str)], cap: usize) -> Result<String, NetError> {
+    let mut req = agent().get(url);
+    for (k, v) in headers {
+        req = req.set(k, v);
+    }
+    let resp = req.call().map_err(|e| NetError::Http(e.to_string()))?;
+    let mut reader = resp.into_reader();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 32 * 1024];
+    loop {
+        let m = reader.read(&mut chunk)?;
+        if m == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..m]);
+        if buf.len() > cap {
+            return Err(NetError::TooLarge);
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// POST `url` with `headers` plus `Content-Type: application/json`,
+/// sending `body` as JSON, reading the response up to `cap` bytes.
+/// Header values and the request body are never included in error messages.
+pub fn post_json(
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &serde_json::Value,
+    cap: usize,
+) -> Result<String, NetError> {
+    let json = serde_json::to_vec(body).map_err(|_| NetError::Parse("json encode"))?;
+    let mut req = agent()
+        .post(url)
+        .set("Content-Type", "application/json");
+    for (k, v) in headers {
+        req = req.set(k, v);
+    }
+    let resp = req.send_bytes(&json).map_err(|e| NetError::Http(e.to_string()))?;
+    let mut reader = resp.into_reader();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 32 * 1024];
+    loop {
+        let m = reader.read(&mut chunk)?;
+        if m == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..m]);
+        if buf.len() > cap {
+            return Err(NetError::TooLarge);
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+
 /// Fetch a page and return its readable text (HTML stripped).
 pub fn fetch_page_text(url: &str) -> Result<String, NetError> {
     let body = get_text(url, 4 * 1024 * 1024)?;
@@ -407,6 +465,20 @@ mod tests {
         let results = v.get("results").unwrap().as_array().unwrap();
         assert_eq!(results.len(), 1);
     }
+
+    #[test]
+    fn post_json_no_leak() {
+        // Connection refused on loopback; no external network.
+        // Error messages must not contain header values (e.g., Authorization).
+        let headers = &[("Authorization", "Bearer TESTSECRET")];
+        let body = serde_json::json!({"ping": 1});
+        let err = post_json("http://127.0.0.1:1/x", headers, &body, 1024).unwrap_err();
+        let display = format!("{}", err);
+        let debug = format!("{:?}", err);
+        assert!(!display.contains("TESTSECRET"), "Display leaked secret: {}", display);
+        assert!(!debug.contains("TESTSECRET"), "Debug leaked secret: {}", debug);
+    }
+
 
     /// Transport checks against a LOCAL http server (this sandbox's
     /// proxy breaks outbound TLS for rustls clients, and search
