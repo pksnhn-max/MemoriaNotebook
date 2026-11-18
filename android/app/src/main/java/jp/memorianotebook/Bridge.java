@@ -9,7 +9,9 @@ public final class Bridge {
 
     private Bridge() {}
 
-    public static native boolean init(String dataDir);
+    public static native boolean init(String dataDir, String ortLibPath);
+    /** Display name of the live embedder seat (ruri or the BoW fallback). */
+    public static native String embedderInfo();
     public static native long createNotebook(String title, long nowSeconds);
     public static native long addTextSource(long notebookId, String title, String text);
     public static native boolean deleteNotebook(long notebookId);

@@ -5,9 +5,10 @@
 //! `CoreState` behind a mutex (the core's single-owner contract is
 //! honoured by serializing here).
 //!
-//! Seats are placeholders in this scaffold: a bag-of-words embedder
-//! and a canned generator stand in until stage 6c (ruri) and 6d/6e
-//! (TinySwallow / API) land behind the same traits.
+//! The embedder seat is real since 6c (ruri via notebook-embed,
+//! with the bag-of-words placeholder as the visible fallback);
+//! the generator is still canned until 6d/6e (TinySwallow / API)
+//! land behind the same trait.
 //!
 //! The JNI class is `jp.memorianotebook.Bridge` — provisional until
 //! the package name is ruled.
@@ -20,7 +21,18 @@ use notebook_core::{
 };
 use std::sync::Mutex;
 
-static STATE: Mutex<Option<CoreState>> = Mutex::new(None);
+/// Everything the bridge owns: the core plus the embedder seat.
+/// The embedder is chosen once at init (ruri when its files are
+/// present, the BoW placeholder otherwise) and its display name is
+/// kept so the settings screen can show which seat is live — a
+/// fallback is visible, never silent.
+struct Host {
+    core: CoreState,
+    emb: Box<dyn Embedder + Send>,
+    emb_name: String,
+}
+
+static STATE: Mutex<Option<Host>> = Mutex::new(None);
 
 /// Placeholder embedder (bag-of-words feature hashing), same family
 /// as the core's test fake. Replaced by ruri in stage 6c.
@@ -131,38 +143,129 @@ fn fmt_turns(st: &CoreState, nb: u64) -> CoreResult<String> {
         .join("\n"))
 }
 
-fn with_state<T>(f: impl FnOnce(&mut CoreState) -> CoreResult<T>) -> Result<T, String> {
+fn with_state<T>(f: impl FnOnce(&mut Host) -> CoreResult<T>) -> Result<T, String> {
     let mut guard = STATE.lock().map_err(|_| "state poisoned".to_string())?;
-    let st = guard.as_mut().ok_or("not initialized")?;
-    f(st).map_err(|e| e.to_string())
+    let host = guard.as_mut().ok_or("not initialized")?;
+    f(host).map_err(|e| e.to_string())
 }
 
 fn jstring_to_string(env: &mut JNIEnv, s: &JString) -> Result<String, String> {
     Ok(env.get_string(s).map_err(|e| e.to_string())?.into())
 }
 
-/// Initialize the core at `data_dir`. Returns 1 on success, 0 on failure.
+/// Initialize the core at `data_dir` and choose the embedder
+/// seat: ruri when the host has extracted its files into
+/// `data_dir/ruri/` and passes a usable ONNX Runtime path,
+/// otherwise the BoW placeholder. When the seat changes (tag
+/// mismatch), every existing source is re-indexed once, because
+/// stored vectors are only valid for their own embedder.
 #[no_mangle]
 pub extern "C" fn Java_jp_memorianotebook_Bridge_init(
     mut env: JNIEnv,
     _class: JClass,
     data_dir: JString,
+    ort_lib_path: JString,
 ) -> jboolean {
     let dir = match jstring_to_string(&mut env, &data_dir) {
         Ok(d) => d,
         Err(_) => return 0,
     };
-    match CoreState::new(std::path::Path::new(&dir), EngineCfg::default(), "TinySwallow") {
-        Ok(st) => {
-            let mut guard = match STATE.lock() {
-                Ok(g) => g,
-                Err(_) => return 0,
-            };
-            *guard = Some(st);
-            1
-        }
-        Err(_) => 0,
-    }
+    let ort_path = jstring_to_string(&mut env, &ort_lib_path).unwrap_or_default();
+    let root = std::path::Path::new(&dir);
+    let mut core = match CoreState::new(root, EngineCfg::default(), "TinySwallow") {
+        Ok(st) => st,
+        Err(_) => return 0,
+    };
+    let model = root.join("ruri").join("model_int8.onnx");
+    let tokenizer = root.join("ruri").join("tokenizer.json");
+    let (emb, emb_name): (Box<dyn Embedder + Send>, String) =
+        if !ort_path.is_empty() && model.exists() && tokenizer.exists() {
+            match notebook_embed::RuriEmbedder::new(
+                &ort_path,
+                model.to_str().unwrap_or(""),
+                tokenizer.to_str().unwrap_or(""),
+            ) {
+                Ok(mut ruri) => {
+                    let tag_path = root.join("embedder.tag");
+                    let tag_ok = std::fs::read_to_string(&tag_path)
+                        .map(|t| t.trim() == notebook_embed::TAG)
+                        .unwrap_or(false);
+                    if !tag_ok {
+                        let ids: Vec<u64> = core
+                            .notebooks()
+                            .iter()
+                            .flat_map(|n| core.sources_of(n.id))
+                            .map(|s| s.id)
+                            .collect();
+                        let mut reindex: CoreResult<()> = Ok(());
+                        for id in ids {
+                            if let Err(e) = core.index_source(id, &mut ruri) {
+                                reindex = Err(e);
+                                break;
+                            }
+                        }
+                        match reindex {
+                            Ok(()) => {
+                                let _ = std::fs::write(
+                                    &tag_path,
+                                    notebook_embed::TAG,
+                                );
+                                (
+                                    Box::new(ruri),
+                                    "ruri-v3-30m（256次元）".to_string(),
+                                )
+                            }
+                            Err(e) => (
+                                Box::new(ruri),
+                                format!(
+                                    "ruri-v3-30m（256次元）／再索引で失敗: {e}"
+                                ),
+                            ),
+                        }
+                    } else {
+                        (
+                            Box::new(ruri),
+                            "ruri-v3-30m（256次元）".to_string(),
+                        )
+                    }
+                }
+                Err(e) => (
+                    Box::new(BowEmbedder { dim: 64 }),
+                    format!("仮の埋め込み（BoW 64次元）／ruri 読込失敗: {e}"),
+                ),
+            }
+        } else {
+            (
+                Box::new(BowEmbedder { dim: 64 }),
+                "仮の埋め込み（BoW 64次元）".to_string(),
+            )
+        };
+    let mut guard = match STATE.lock() {
+        Ok(g) => g,
+        Err(_) => return 0,
+    };
+    *guard = Some(Host {
+        core,
+        emb,
+        emb_name,
+    });
+    1
+}
+
+/// Display name of the live embedder seat, for the settings screen.
+#[no_mangle]
+pub extern "C" fn Java_jp_memorianotebook_Bridge_embedderInfo(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let name = STATE
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|h| h.emb_name.clone()))
+        .unwrap_or_else(|| "未初期化".to_string());
+    env.new_string(name)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// Create a notebook at `now` (unix seconds, supplied by the host
@@ -178,8 +281,8 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_createNotebook(
         Ok(t) => t,
         Err(_) => return -1,
     };
-    with_state(|st| {
-        let nb = st.create_notebook(&title, now.max(0) as u64)?;
+    with_state(|h| {
+        let nb = h.core.create_notebook(&title, now.max(0) as u64)?;
         Ok(nb.id as jlong)
     })
     .unwrap_or(-1)
@@ -203,11 +306,12 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_addTextSource(
         Ok(t) => t,
         Err(_) => return -1,
     };
-    with_state(|st| {
-        let src = st.add_source(nb as u64, SourceKind::Text, &title, "", 0)?;
-        st.set_source_text(src.id, &text)?;
-        let mut emb = BowEmbedder { dim: 64 };
-        st.index_source(src.id, &mut emb)?;
+    with_state(|h| {
+        let src = h
+            .core
+            .add_source(nb as u64, SourceKind::Text, &title, "", 0)?;
+        h.core.set_source_text(src.id, &text)?;
+        h.core.index_source(src.id, &mut *h.emb)?;
         Ok(src.id as jlong)
     })
     .unwrap_or(-1)
@@ -220,7 +324,7 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_deleteNotebook(
     _class: JClass,
     nb: jlong,
 ) -> jboolean {
-    match with_state(|st| st.delete_notebook(nb as u64)) {
+    match with_state(|h| h.core.delete_notebook(nb as u64)) {
         Ok(()) => 1,
         Err(_) => 0,
     }
@@ -244,10 +348,11 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_ask(
                 .unwrap_or(std::ptr::null_mut())
         }
     };
-    let result = with_state(|st| {
-        let mut emb = BowEmbedder { dim: 64 };
+    let result = with_state(|h| {
         let mut gen = CannedGenerator;
-        let turn: ChatTurn = st.ask(nb as u64, &question, &mut emb, &mut gen, 5, 0)?;
+        let turn: ChatTurn =
+            h.core
+                .ask(nb as u64, &question, &mut *h.emb, &mut gen, 5, 0)?;
         Ok(turn.text)
     });
     let text = match result {
@@ -275,7 +380,7 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_listNotebooks(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    let result = with_state(|st| Ok(fmt_notebooks(st)));
+    let result = with_state(|h| Ok(fmt_notebooks(&h.core)));
     string_result(&mut env, result)
 }
 
@@ -286,7 +391,7 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_listSources(
     _class: JClass,
     nb: jlong,
 ) -> jstring {
-    let result = with_state(|st| Ok(fmt_sources(st, nb as u64)));
+    let result = with_state(|h| Ok(fmt_sources(&h.core, nb as u64)));
     string_result(&mut env, result)
 }
 
@@ -298,7 +403,7 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_listTurns(
     _class: JClass,
     nb: jlong,
 ) -> jstring {
-    let result = with_state(|st| fmt_turns(st, nb as u64));
+    let result = with_state(|h| fmt_turns(&h.core, nb as u64));
     string_result(&mut env, result)
 }
 

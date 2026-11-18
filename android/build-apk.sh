@@ -33,10 +33,19 @@ javac -encoding UTF-8 -cp "$AJAR" -d "$W/classes" $(find java -name '*.java')
 # 3. Package, align, sign (debug key).
 "$BT/aapt2" link -o "$W/app-unsigned.apk" -I "$AJAR" --manifest AndroidManifest.xml
 cp "$ROOT/target/aarch64-linux-android/release/libnotebook_app.so" "$W/lib/arm64-v8a/"
+# ONNX Runtime (arm64, from the official 1.23.2 AAR) sits next to
+# the app library; the Rust side dlopens it by path at init.
+RURI_ASSETS="${RURI_ASSETS:-$HOME/workspace/ruri-assets}"
+cp "$RURI_ASSETS/libonnxruntime-arm64.so" "$W/lib/arm64-v8a/libonnxruntime.so"
+# The ruri model files ride as assets; the vessel extracts them to
+# filesDir on first launch.
+mkdir -p "$W/assets/ruri"
+cp "$RURI_ASSETS/model_int8.onnx" "$RURI_ASSETS/tokenizer.json" "$W/assets/ruri/"
 cd "$W"
 cp dex/classes.dex .
 zip -q app-unsigned.apk classes.dex
-zip -q -0 app-unsigned.apk lib/arm64-v8a/libnotebook_app.so
+zip -q -0 app-unsigned.apk lib/arm64-v8a/libnotebook_app.so lib/arm64-v8a/libonnxruntime.so
+zip -q -9 app-unsigned.apk assets/ruri/model_int8.onnx assets/ruri/tokenizer.json
 "$BT/zipalign" -f 4 app-unsigned.apk app-aligned.apk
 # The debug key must be STABLE across builds, or Android refuses to
 # install a new build over the previous one. It therefore lives

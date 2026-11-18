@@ -9,3 +9,4 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 notebook-core = { path = "../notebook-core" }
 jni = "0.21"
+notebook-embed = { path = "../notebook-embed" }

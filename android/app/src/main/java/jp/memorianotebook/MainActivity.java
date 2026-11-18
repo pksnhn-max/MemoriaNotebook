@@ -192,8 +192,11 @@ public final class MainActivity extends Activity {
         });
         setContentView(root);
 
+        extractRuriAssets();
         try {
-            if (!Bridge.init(getFilesDir().getAbsolutePath())) {
+            String ortPath = getApplicationInfo().nativeLibraryDir
+                    + "/libonnxruntime.so";
+            if (!Bridge.init(getFilesDir().getAbsolutePath(), ortPath)) {
                 screen.addView(text("核の初期化に失敗しました。", 15, ink, false, false));
                 return;
             }
@@ -217,6 +220,36 @@ public final class MainActivity extends Activity {
         out.putLong("nb", currentNb);
         out.putString("title", currentTitle);
         out.putInt("tab", currentTab);
+    }
+
+    /** Copy the bundled ruri model files out of the APK's assets
+     *  into filesDir/ruri/, where the Rust side can open them by
+     *  path. Skips files already extracted at the same size. If the
+     *  assets are absent (a dev build), the Rust side simply falls
+     *  back to the placeholder embedder. */
+    private void extractRuriAssets() {
+        try {
+            java.io.File dir = new java.io.File(getFilesDir(), "ruri");
+            if (!dir.exists()) dir.mkdirs();
+            String[] names = {"model_int8.onnx", "tokenizer.json"};
+            for (String name : names) {
+                java.io.File out = new java.io.File(dir, name);
+                android.content.res.AssetFileDescriptor afd =
+                        getAssets().openFd("ruri/" + name);
+                long assetLen = afd.getLength();
+                afd.close();
+                if (out.exists() && out.length() == assetLen) continue;
+                java.io.InputStream in = getAssets().open("ruri/" + name);
+                java.io.FileOutputStream fos = new java.io.FileOutputStream(out);
+                byte[] buf = new byte[65536];
+                int r;
+                while ((r = in.read(buf)) > 0) fos.write(buf, 0, r);
+                fos.close();
+                in.close();
+            }
+        } catch (Throwable t) {
+            // No ruri assets in this build: fallback seat it is.
+        }
     }
 
     private void clearScreen() {
@@ -469,6 +502,13 @@ public final class MainActivity extends Activity {
         model.addView(text("TinySwallow-1.5B-Instruct　［既定］", 15, ink, false, true));
         model.addView(text("1.5B ・ Q4_K_M ・ 0.99 GB ・ コンテキスト 32,768 ・ 未導入",
                 12, sub, false, false));
+        String embInfo;
+        try {
+            embInfo = Bridge.embedderInfo();
+        } catch (Throwable th) {
+            embInfo = "不明";
+        }
+        model.addView(text("埋め込み：" + embInfo, 12, sub, false, false));
         screen.addView(model, matchWrap(8));
 
         screen.addView(text("音声概要について", 13, sub, false, true), matchWrap(16));

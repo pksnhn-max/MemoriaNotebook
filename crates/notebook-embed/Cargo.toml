@@ -1,0 +1,13 @@
+[package]
+name = "notebook-embed"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+notebook-core = { path = "../notebook-core" }
+# The version pairing is load-bearing (verified on host 2026-11-17):
+# ort rc.15's default features enable api-31, whose version check
+# rejects every real ONNX Runtime binary. Pin api-23 and pair with
+# ONNX Runtime 1.23.2, loaded dynamically (never linked).
+ort = { version = "2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "load-dynamic", "api-23"] }
+tokenizers = "0.21"
