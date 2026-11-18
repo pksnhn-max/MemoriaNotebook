@@ -1,0 +1,9 @@
+[package]
+name = "notebook-infer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+notebook-core = { path = "../notebook-core" }
+llama-cpp-2 = "0.1"
+encoding_rs = "0.8"

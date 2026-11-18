@@ -21,6 +21,18 @@ W="${OUT_DIR:-/tmp/nbapk}"
 rm -rf "$W"
 mkdir -p "$W/classes" "$W/dex" "$W/lib/arm64-v8a"
 
+# llama.cpp (notebook-infer, since 6d) builds C++ via cmake and
+# generates bindings via bindgen during the cross build: bindgen
+# runs on the host and needs the NDK's libclang, and cmake needs
+# the NDK toolchain file to target Android instead of the host.
+export LIBCLANG_PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/musl/lib"
+export BINDGEN_EXTRA_CLANG_ARGS="-I$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/18/include"
+export ANDROID_NDK="$ANDROID_NDK_HOME"
+export ANDROID_NDK_ROOT="$ANDROID_NDK_HOME"
+export CMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
+export ANDROID_ABI="arm64-v8a"
+export ANDROID_PLATFORM="android-26"
+
 # 1. Rust .so for arm64 (cargo-ndk 4.x: platform flag is -P).
 cd "$ROOT"
 cargo ndk -t arm64-v8a -P 26 build --release -p notebook-app --offline
@@ -33,6 +45,10 @@ javac -encoding UTF-8 -cp "$AJAR" -d "$W/classes" $(find java -name '*.java')
 # 3. Package, align, sign (debug key).
 "$BT/aapt2" link -o "$W/app-unsigned.apk" -I "$AJAR" --manifest AndroidManifest.xml
 cp "$ROOT/target/aarch64-linux-android/release/libnotebook_app.so" "$W/lib/arm64-v8a/"
+# llama.cpp links the NDK's shared C++ runtime; the app library
+# NEEDs libc++_shared.so, so it ships alongside (from the NDK
+# sysroot). Without it the library fails to load on device.
+cp "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" "$W/lib/arm64-v8a/"
 # ONNX Runtime (arm64, from the official 1.23.2 AAR) sits next to
 # the app library; the Rust side dlopens it by path at init.
 RURI_ASSETS="${RURI_ASSETS:-$HOME/workspace/ruri-assets}"
@@ -44,7 +60,7 @@ cp "$RURI_ASSETS/model_int8.onnx" "$RURI_ASSETS/tokenizer.json" "$W/assets/ruri/
 cd "$W"
 cp dex/classes.dex .
 zip -q app-unsigned.apk classes.dex
-zip -q -0 app-unsigned.apk lib/arm64-v8a/libnotebook_app.so lib/arm64-v8a/libonnxruntime.so
+zip -q -0 app-unsigned.apk lib/arm64-v8a/libnotebook_app.so lib/arm64-v8a/libonnxruntime.so lib/arm64-v8a/libc++_shared.so
 zip -q -9 app-unsigned.apk assets/ruri/model_int8.onnx assets/ruri/tokenizer.json
 "$BT/zipalign" -f 4 app-unsigned.apk app-aligned.apk
 # The debug key must be STABLE across builds, or Android refuses to
@@ -59,6 +75,6 @@ if [ ! -f "$KEYSTORE" ]; then
     -validity 10000 -dname 'CN=Android Debug,O=Android,C=US'
 fi
 "$BT/apksigner" sign --ks "$KEYSTORE" --ks-pass pass:android \
-  --key-pass pass:android --out "$W/MemoriaNotebook-6a.apk" app-aligned.apk
-"$BT/apksigner" verify "$W/MemoriaNotebook-6a.apk"
-echo "APK: $W/MemoriaNotebook-6a.apk"
+  --key-pass pass:android --out "$W/MemoriaNotebook-6d.apk" app-aligned.apk
+"$BT/apksigner" verify "$W/MemoriaNotebook-6d.apk"
+echo "APK: $W/MemoriaNotebook-6d.apk"

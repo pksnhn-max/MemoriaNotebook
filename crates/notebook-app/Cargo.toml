@@ -10,3 +10,6 @@ crate-type = ["cdylib", "rlib"]
 notebook-core = { path = "../notebook-core" }
 jni = "0.21"
 notebook-embed = { path = "../notebook-embed" }
+notebook-infer = { path = "../notebook-infer" }
+notebook-extract = { path = "../notebook-extract" }
+notebook-net = { path = "../notebook-net" }

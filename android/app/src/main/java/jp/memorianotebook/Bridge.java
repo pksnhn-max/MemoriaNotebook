@@ -12,6 +12,20 @@ public final class Bridge {
     public static native boolean init(String dataDir, String ortLibPath);
     /** Display name of the live embedder seat (ruri or the BoW fallback). */
     public static native String embedderInfo();
+    /** Display name of the local generator seat ("未導入" until downloaded). */
+    public static native String modelInfo();
+    /** Hugging Face GGUF repo search; one repo id per line, or ERR:. */
+    public static native String searchModels(String query);
+    /** A repo's GGUF files: name \t size per line, or ERR:. */
+    public static native String listModelFiles(String repo);
+    /** Download one GGUF into the models dir (blocking). "OK bytes" or ERR:. */
+    public static native String downloadModel(String repo, String file);
+    /** Add a file (epub / txt / md bytes) as a source; source id or -1. */
+    public static native long addFileSource(long notebookId, String title, String kind, byte[] bytes);
+    /** Web search; title \t url \t snippet per line, or ERR:. */
+    public static native String webSearch(String query);
+    /** Fetch a page and add it as a source. "OK id" or ERR:. */
+    public static native String addWebSource(long notebookId, String title, String url);
     public static native long createNotebook(String title, long nowSeconds);
     public static native long addTextSource(long notebookId, String title, String text);
     public static native boolean deleteNotebook(long notebookId);

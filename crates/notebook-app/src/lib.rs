@@ -7,8 +7,12 @@
 //!
 //! The embedder seat is real since 6c (ruri via notebook-embed,
 //! with the bag-of-words placeholder as the visible fallback);
-//! the generator is still canned until 6d/6e (TinySwallow / API)
-//! land behind the same trait.
+//! the generator seat is real since 6d (TinySwallow via
+//! notebook-infer/llama.cpp, loaded lazily from the models dir;
+//! with no model on device, ask() refuses with guidance instead
+//! of faking an answer). File import (notebook-extract) and the
+//! network seat (notebook-net: model download, web search, page
+//! fetch) also land in 6d.
 //!
 //! The JNI class is `jp.memorianotebook.Bridge` — provisional until
 //! the package name is ruled.
@@ -16,9 +20,9 @@
 use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jlong, jstring};
 use jni::JNIEnv;
-use notebook_core::{
-    ChatTurn, CoreResult, CoreState, Embedder, EngineCfg, Generator, SourceKind,
-};
+use notebook_core::{ChatTurn, CoreResult, CoreState, Embedder, EngineCfg, SourceKind};
+#[cfg(test)]
+use notebook_core::Generator;
 use std::sync::Mutex;
 
 /// Everything the bridge owns: the core plus the embedder seat.
@@ -30,6 +34,40 @@ struct Host {
     core: CoreState,
     emb: Box<dyn Embedder + Send>,
     emb_name: String,
+    data_dir: std::path::PathBuf,
+    /// The local generator seat: loaded lazily on the first ask
+    /// once a GGUF sits in the models dir (a 1 GB model is not
+    /// something to load on every cold start before it is needed).
+    gen: Option<notebook_infer::LlamaGenerator>,
+    gen_name: String,
+}
+
+/// The GGUF currently designated as the local model: the first
+/// `.gguf` file (sorted) in `data_dir/models`, if any.
+fn designated_model(data_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dir = data_dir.join("models");
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .map(|e| e.eq_ignore_ascii_case("gguf"))
+                .unwrap_or(false)
+        })
+        .collect();
+    files.sort();
+    files.into_iter().next()
+}
+
+fn gen_name_for(data_dir: &std::path::Path) -> String {
+    match designated_model(data_dir) {
+        Some(p) => p
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "ローカルモデル".to_string()),
+        None => "未導入".to_string(),
+    }
 }
 
 static STATE: Mutex<Option<Host>> = Mutex::new(None);
@@ -55,11 +93,13 @@ impl Embedder for BowEmbedder {
     }
 }
 
-/// Placeholder generator: cites the first grounding marker it finds
-/// in the prompt, so the citation path is exercised end to end on
-/// device. Replaced by real models in stage 6d/6e.
+/// Test-only generator: cites the first grounding marker it finds
+/// in the prompt, so the citation path is exercised end to end.
+/// (The device path never fakes an answer — see ask().)
+#[cfg(test)]
 struct CannedGenerator;
 
+#[cfg(test)]
 impl Generator for CannedGenerator {
     fn generate(&mut self, prompt: &str) -> CoreResult<String> {
         let bytes = prompt.as_bytes();
@@ -240,6 +280,7 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_init(
                 "仮の埋め込み（BoW 64次元）".to_string(),
             )
         };
+    let gen_name = gen_name_for(root);
     let mut guard = match STATE.lock() {
         Ok(g) => g,
         Err(_) => return 0,
@@ -248,6 +289,9 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_init(
         core,
         emb,
         emb_name,
+        data_dir: root.to_path_buf(),
+        gen: None,
+        gen_name,
     });
     1
 }
@@ -349,10 +393,28 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_ask(
         }
     };
     let result = with_state(|h| {
-        let mut gen = CannedGenerator;
+        // Generator seat: the local model, loaded lazily. With no
+        // model on device the ask refuses with guidance — an
+        // unrecorded error, never a faked answer.
+        if h.gen.is_none() {
+            match designated_model(&h.data_dir) {
+                Some(path) => {
+                    let gen = notebook_infer::LlamaGenerator::load(path)?;
+                    h.gen_name = gen_name_for(&h.data_dir);
+                    h.gen = Some(gen);
+                }
+                None => {
+                    return Err(notebook_core::CoreError::GeneratorError(
+                        "モデルが未導入です。設定のモデル管理からダウンロードしてください"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        let gen = h.gen.as_mut().expect("generator loaded above");
         let turn: ChatTurn =
             h.core
-                .ask(nb as u64, &question, &mut *h.emb, &mut gen, 5, 0)?;
+                .ask(nb as u64, &question, &mut *h.emb, gen, 5, 0)?;
         Ok(turn.text)
     });
     let text = match result {
@@ -362,6 +424,184 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_ask(
     env.new_string(text)
         .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())
+}
+
+/// Display name of the local generator seat, for the settings
+/// screen ("未導入" until a GGUF sits in the models dir).
+#[no_mangle]
+pub extern "C" fn Java_jp_memorianotebook_Bridge_modelInfo(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let name = STATE
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|h| h.gen_name.clone()))
+        .unwrap_or_else(|| "未初期化".to_string());
+    env.new_string(name)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Search Hugging Face for GGUF repos; one repo id per line,
+/// or `ERR: ...`.
+#[no_mangle]
+pub extern "C" fn Java_jp_memorianotebook_Bridge_searchModels(
+    mut env: JNIEnv,
+    _class: JClass,
+    query: JString,
+) -> jstring {
+    let result = (|| -> Result<String, String> {
+        let q = jstring_to_string(&mut env, &query)?;
+        let repos = notebook_net::hf_search_models(&q).map_err(|e| e.to_string())?;
+        Ok(repos.join("\n"))
+    })();
+    string_result(&mut env, result)
+}
+
+/// List a repo's GGUF files: `name \t size` per line, or `ERR: ...`.
+#[no_mangle]
+pub extern "C" fn Java_jp_memorianotebook_Bridge_listModelFiles(
+    mut env: JNIEnv,
+    _class: JClass,
+    repo: JString,
+) -> jstring {
+    let result = (|| -> Result<String, String> {
+        let repo = jstring_to_string(&mut env, &repo)?;
+        let files = notebook_net::hf_model_files(&repo).map_err(|e| e.to_string())?;
+        Ok(files
+            .iter()
+            .map(|(n, s)| format!("{n}\t{s}"))
+            .collect::<Vec<_>>()
+            .join("\n"))
+    })();
+    string_result(&mut env, result)
+}
+
+/// Download one GGUF from a Hugging Face repo into the models dir
+/// (blocking; the vessel calls this off the UI thread). Returns
+/// `OK <bytes>` or `ERR: ...`. The downloaded model becomes the
+/// designated local model; any loaded generator is dropped so the
+/// next ask reloads.
+#[no_mangle]
+pub extern "C" fn Java_jp_memorianotebook_Bridge_downloadModel(
+    mut env: JNIEnv,
+    _class: JClass,
+    repo: JString,
+    file: JString,
+) -> jstring {
+    let result = (|| -> Result<String, String> {
+        let repo = jstring_to_string(&mut env, &repo)?;
+        let file = jstring_to_string(&mut env, &file)?;
+        let data_dir = {
+            let guard = STATE.lock().map_err(|_| "state poisoned".to_string())?;
+            let host = guard.as_ref().ok_or("not initialized")?;
+            host.data_dir.clone()
+        };
+        let dir = data_dir.join("models");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let dest = dir.join(&file);
+        let url = notebook_net::hf_resolve_url(&repo, &file);
+        let n = notebook_net::download_to_file(&url, &dest, |_, _| {})
+            .map_err(|e| e.to_string())?;
+        {
+            let mut guard = STATE.lock().map_err(|_| "state poisoned".to_string())?;
+            if let Some(host) = guard.as_mut() {
+                host.gen = None;
+                host.gen_name = gen_name_for(&host.data_dir);
+            }
+        }
+        Ok(format!("OK {n}"))
+    })();
+    string_result(&mut env, result)
+}
+
+/// Add a file as a source: `kind` is "epub" or anything else for
+/// plain text (txt/md, UTF-8 or Shift_JIS). The bytes are extracted
+/// to text by notebook-extract, then set and indexed like a pasted
+/// source. Returns the source id, or -1.
+#[no_mangle]
+pub extern "C" fn Java_jp_memorianotebook_Bridge_addFileSource(
+    mut env: JNIEnv,
+    _class: JClass,
+    nb: jlong,
+    title: JString,
+    kind: JString,
+    bytes: jni::objects::JByteArray,
+) -> jlong {
+    let title = match jstring_to_string(&mut env, &title) {
+        Ok(t) => t,
+        Err(_) => return -1,
+    };
+    let kind = jstring_to_string(&mut env, &kind).unwrap_or_default();
+    let raw = match env.convert_byte_array(&bytes) {
+        Ok(b) => b,
+        Err(_) => return -1,
+    };
+    let text = if kind.eq_ignore_ascii_case("epub") {
+        match notebook_extract::extract_epub(&raw) {
+            Ok(t) => t,
+            Err(_) => return -1,
+        }
+    } else {
+        notebook_extract::extract_txt(&raw)
+    };
+    with_state(|h| {
+        let src = h
+            .core
+            .add_source(nb as u64, SourceKind::Text, &title, "", 0)?;
+        h.core.set_source_text(src.id, &text)?;
+        h.core.index_source(src.id, &mut *h.emb)?;
+        Ok(src.id as jlong)
+    })
+    .unwrap_or(-1)
+}
+
+/// Web search; one hit per line: `title \t url \t snippet`,
+/// or `ERR: ...`.
+#[no_mangle]
+pub extern "C" fn Java_jp_memorianotebook_Bridge_webSearch(
+    mut env: JNIEnv,
+    _class: JClass,
+    query: JString,
+) -> jstring {
+    let result = (|| -> Result<String, String> {
+        let q = jstring_to_string(&mut env, &query)?;
+        let hits = notebook_net::search_web(&q, 10).map_err(|e| e.to_string())?;
+        Ok(hits
+            .iter()
+            .map(|h| format!("{}\t{}\t{}", esc(&h.title), esc(&h.url), esc(&h.snippet)))
+            .collect::<Vec<_>>()
+            .join("\n"))
+    })();
+    string_result(&mut env, result)
+}
+
+/// Fetch a web page and add its text as a source. Returns
+/// `OK <source id>` or `ERR: ...`.
+#[no_mangle]
+pub extern "C" fn Java_jp_memorianotebook_Bridge_addWebSource(
+    mut env: JNIEnv,
+    _class: JClass,
+    nb: jlong,
+    title: JString,
+    url: JString,
+) -> jstring {
+    let result = (|| -> Result<String, String> {
+        let title = jstring_to_string(&mut env, &title)?;
+        let url = jstring_to_string(&mut env, &url)?;
+        let text = notebook_net::fetch_page_text(&url).map_err(|e| e.to_string())?;
+        let id = with_state(|h| {
+            let src = h
+                .core
+                .add_source(nb as u64, SourceKind::Text, &title, &url, 0)?;
+            h.core.set_source_text(src.id, &text)?;
+            h.core.index_source(src.id, &mut *h.emb)?;
+            Ok(src.id as jlong)
+        })?;
+        Ok(format!("OK {id}"))
+    })();
+    string_result(&mut env, result)
 }
 
 fn string_result(env: &mut JNIEnv, result: Result<String, String>) -> jstring {

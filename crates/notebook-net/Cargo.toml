@@ -1,0 +1,9 @@
+[package]
+name = "notebook-net"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+notebook-extract = { path = "../notebook-extract" }
+ureq = "2"
+serde_json = "1"

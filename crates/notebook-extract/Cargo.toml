@@ -1,0 +1,9 @@
+[package]
+name = "notebook-extract"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }
+quick-xml = "0.38"
+encoding_rs = "0.8"

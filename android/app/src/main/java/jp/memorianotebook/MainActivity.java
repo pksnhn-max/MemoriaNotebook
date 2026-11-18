@@ -50,6 +50,39 @@ public final class MainActivity extends Activity {
     private String searchQuery = "";
     private LinearLayout gridBox;
 
+    private static final int REQ_PICK_FILE = 41;
+    private final java.util.concurrent.ExecutorService bg =
+            java.util.concurrent.Executors.newSingleThreadExecutor();
+    private String hfQuery = "";
+    private String[][] hfRepos = new String[0][];
+    private String hfFileRepo = "";
+    private String[][] hfFiles = new String[0][];
+
+    /** Run JNI work that can block (generation, downloads, fetches)
+     *  off the UI thread, then finish back on it. */
+    private void runBg(final Runnable work, final Runnable done) {
+        bg.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    work.run();
+                } catch (Throwable t) {
+                    // JNI calls report errors as ERR: strings; a
+                    // thrown exception here is a vessel bug — still
+                    // finish on the UI thread so the screen recovers.
+                }
+                if (done != null) {
+                    runOnUiThread(done);
+                }
+            }
+        });
+    }
+
+    private void toast(String msg) {
+        android.widget.Toast.makeText(this, msg,
+                android.widget.Toast.LENGTH_LONG).show();
+    }
+
     // ---------- small helpers ----------
 
     private int dp(int v) {
@@ -488,7 +521,7 @@ public final class MainActivity extends Activity {
         seat.setBackground(cardBg());
         seat.setPadding(sdp(14), sdp(12), sdp(14), sdp(12));
         seat.addView(text("● ローカル（既定）", 15, ink, false, true));
-        seat.addView(text("端末内のモデルで生成します。モデル本体は未導入です。",
+        seat.addView(text("端末内のモデルで生成します。",
                 12, sub, false, false));
         seat.addView(text("○ API（任意）", 15, ink, false, false), matchWrap(10));
         seat.addView(text("自分のエンドポイントとキーを差す席です。接続は次の更新で入ります。",
@@ -499,8 +532,18 @@ public final class MainActivity extends Activity {
         LinearLayout model = column();
         model.setBackground(cardBg());
         model.setPadding(sdp(14), sdp(12), sdp(14), sdp(12));
-        model.addView(text("TinySwallow-1.5B-Instruct　［既定］", 15, ink, false, true));
-        model.addView(text("1.5B ・ Q4_K_M ・ 0.99 GB ・ コンテキスト 32,768 ・ 未導入",
+        String modelInfo;
+        try {
+            modelInfo = Bridge.modelInfo();
+        } catch (Throwable th) {
+            modelInfo = "不明";
+        }
+        final boolean hasModel = modelInfo != null && !modelInfo.equals("未導入");
+        model.addView(text(hasModel ? modelInfo : "TinySwallow-1.5B-Instruct　［既定］",
+                15, ink, false, true));
+        model.addView(text(hasModel
+                        ? "導入済み（端末内）"
+                        : "1.5B ・ Q5_K_M ・ 1.13 GB ・ 未導入",
                 12, sub, false, false));
         String embInfo;
         try {
@@ -509,7 +552,159 @@ public final class MainActivity extends Activity {
             embInfo = "不明";
         }
         model.addView(text("埋め込み：" + embInfo, 12, sub, false, false));
+        if (!hasModel) {
+            final Button dl = pillBtn("TinySwallow をダウンロード");
+            dl.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    dl.setEnabled(false);
+                    dl.setText("ダウンロード中…（約1.1 GB）");
+                    final String[] res = new String[1];
+                    runBg(new Runnable() {
+                        @Override
+                        public void run() {
+                            res[0] = Bridge.downloadModel(
+                                    "SakanaAI/TinySwallow-1.5B-Instruct-GGUF",
+                                    "tinyswallow-1.5b-instruct-q5_k_m.gguf");
+                        }
+                    }, new Runnable() {
+                        @Override
+                        public void run() {
+                            if (res[0] != null && res[0].startsWith("OK")) {
+                                toast("モデルを導入しました");
+                            } else {
+                                toast("ダウンロードに失敗しました");
+                            }
+                            showSettings();
+                        }
+                    });
+                }
+            });
+            model.addView(dl, matchWrap(10));
+        }
         screen.addView(model, matchWrap(8));
+
+        // Model search on Hugging Face (the only add path, as in
+        // Memoria's model management): search repos, pick a GGUF
+        // file, download it as the local model.
+        screen.addView(text("モデルを探す（Hugging Face）", 13, sub, false, true),
+                matchWrap(16));
+        LinearLayout hf = column();
+        hf.setBackground(cardBg());
+        hf.setPadding(sdp(14), sdp(12), sdp(14), sdp(12));
+        LinearLayout hfRow = new LinearLayout(this);
+        hfRow.setOrientation(LinearLayout.HORIZONTAL);
+        hfRow.setGravity(Gravity.CENTER_VERTICAL);
+        final EditText hfQ = new EditText(this);
+        hfQ.setHint("モデル名で検索");
+        hfQ.setText(hfQuery);
+        hfQ.setTextColor(ink);
+        hfQ.setHintTextColor(sub);
+        hfQ.setBackgroundColor(Color.TRANSPARENT);
+        hfQ.setLayoutParams(new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        hfRow.addView(hfQ);
+        final Button hfGo = pillBtn("検索");
+        hfGo.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                final String query = hfQ.getText().toString().trim();
+                if (query.isEmpty()) return;
+                hfQuery = query;
+                hfGo.setEnabled(false);
+                final String[] raw = new String[1];
+                runBg(new Runnable() {
+                    @Override
+                    public void run() {
+                        raw[0] = Bridge.searchModels(query);
+                    }
+                }, new Runnable() {
+                    @Override
+                    public void run() {
+                        hfGo.setEnabled(true);
+                        if (raw[0] != null && raw[0].startsWith("ERR:")) {
+                            toast(raw[0].substring(4).trim());
+                            return;
+                        }
+                        hfRepos = lines(raw[0]);
+                        hfFiles = new String[0][];
+                        hfFileRepo = "";
+                        showSettings();
+                    }
+                });
+            }
+        });
+        hfRow.addView(hfGo);
+        hf.addView(hfRow);
+        for (final String[] repo : hfRepos) {
+            if (repo.length < 1) continue;
+            TextView rv = text(repo[0], 14, ink, false, false);
+            rv.setPadding(0, dp(8), 0, dp(2));
+            rv.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    final String[] raw = new String[1];
+                    runBg(new Runnable() {
+                        @Override
+                        public void run() {
+                            raw[0] = Bridge.listModelFiles(repo[0]);
+                        }
+                    }, new Runnable() {
+                        @Override
+                        public void run() {
+                            if (raw[0] != null && raw[0].startsWith("ERR:")) {
+                                toast(raw[0].substring(4).trim());
+                                return;
+                            }
+                            hfFileRepo = repo[0];
+                            hfFiles = lines(raw[0]);
+                            showSettings();
+                        }
+                    });
+                }
+            });
+            hf.addView(rv);
+        }
+        if (!hfFileRepo.isEmpty()) {
+            hf.addView(text(hfFileRepo + " のファイル", 12, sub, false, true),
+                    matchWrap(10));
+            for (final String[] f : hfFiles) {
+                if (f.length < 1) continue;
+                String size = "";
+                if (f.length > 1) {
+                    try {
+                        long b = Long.parseLong(f[1]);
+                        size = " ・ " + String.format(Locale.JAPAN,
+                                "%.2f GB", b / 1.0e9);
+                    } catch (Throwable ignored) {}
+                }
+                TextView fv = text(f[0] + size, 13, ink, false, false);
+                fv.setPadding(0, dp(6), 0, dp(2));
+                fv.setOnClickListener(new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        toast("ダウンロード中…: " + f[0]);
+                        final String[] res = new String[1];
+                        runBg(new Runnable() {
+                            @Override
+                            public void run() {
+                                res[0] = Bridge.downloadModel(hfFileRepo, f[0]);
+                            }
+                        }, new Runnable() {
+                            @Override
+                            public void run() {
+                                toast(res[0] != null && res[0].startsWith("OK")
+                                        ? "モデルを導入しました"
+                                        : "ダウンロードに失敗しました");
+                                showSettings();
+                            }
+                        });
+                    }
+                });
+                hf.addView(fv);
+            }
+        }
+        screen.addView(hf, matchWrap(8));
 
         screen.addView(text("音声概要について", 13, sub, false, true), matchWrap(16));
         LinearLayout audio = column();
@@ -834,10 +1029,27 @@ public final class MainActivity extends Activity {
         send.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                String q = input.getText().toString().trim();
+                final String q = input.getText().toString().trim();
                 if (q.isEmpty()) return;
-                Bridge.ask(currentNb, q);
-                showNotebook(currentNb, currentTitle, 1);
+                input.setText("");
+                send.setEnabled(false);
+                input.setHint("生成中…（端末内のモデルで考えています）");
+                final long nb = currentNb;
+                final String[] result = new String[1];
+                runBg(new Runnable() {
+                    @Override
+                    public void run() {
+                        result[0] = Bridge.ask(nb, q);
+                    }
+                }, new Runnable() {
+                    @Override
+                    public void run() {
+                        if (result[0] != null && result[0].startsWith("ERR:")) {
+                            toast(result[0].substring(4).trim());
+                        }
+                        showNotebook(currentNb, currentTitle, 1);
+                    }
+                });
             }
         });
         inputRow.addView(send);
@@ -892,6 +1104,226 @@ public final class MainActivity extends Activity {
         });
         add.addView(addBtn);
         body.addView(add, matchWrap(14));
+
+        LinearLayout more = new LinearLayout(this);
+        more.setOrientation(LinearLayout.HORIZONTAL);
+        Button fileBtn = pillBtn("ファイルから追加");
+        fileBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                android.content.Intent intent = new android.content.Intent(
+                        android.content.Intent.ACTION_OPEN_DOCUMENT);
+                intent.addCategory(android.content.Intent.CATEGORY_OPENABLE);
+                intent.setType("*/*");
+                String[] mimes = {"text/plain", "text/markdown",
+                        "application/epub+zip", "application/octet-stream"};
+                intent.putExtra(android.content.Intent.EXTRA_MIME_TYPES, mimes);
+                try {
+                    startActivityForResult(intent, REQ_PICK_FILE);
+                } catch (Throwable t) {
+                    toast("ファイル選択を開けませんでした");
+                }
+            }
+        });
+        more.addView(fileBtn);
+        Button webBtn = pillBtn("Webで探す");
+        LinearLayout.LayoutParams wp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        wp.leftMargin = dp(8);
+        webBtn.setLayoutParams(wp);
+        webBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showWebSearch();
+            }
+        });
+        more.addView(webBtn);
+        body.addView(more, matchWrap(12));
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode,
+            android.content.Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQ_PICK_FILE || resultCode != RESULT_OK
+                || data == null || data.getData() == null || currentNb < 0) {
+            return;
+        }
+        final android.net.Uri uri = data.getData();
+        final long nb = currentNb;
+        toast("ファイルを読み込んでいます…");
+        runBg(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    String name = "ファイル資料";
+                    android.database.Cursor c = getContentResolver().query(
+                            uri, null, null, null, null);
+                    if (c != null) {
+                        if (c.moveToFirst()) {
+                            int ix = c.getColumnIndex(
+                                    android.provider.OpenableColumns.DISPLAY_NAME);
+                            if (ix >= 0) name = c.getString(ix);
+                        }
+                        c.close();
+                    }
+                    java.io.InputStream in = getContentResolver().openInputStream(uri);
+                    java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+                    byte[] buf = new byte[65536];
+                    int r;
+                    while ((r = in.read(buf)) > 0) bos.write(buf, 0, r);
+                    in.close();
+                    String lower = name.toLowerCase(Locale.JAPAN);
+                    String kind = lower.endsWith(".epub") ? "epub" : "txt";
+                    String title = name.replaceAll("\\.[A-Za-z0-9]+$", "");
+                    long id = Bridge.addFileSource(nb, title, kind, bos.toByteArray());
+                    final boolean ok = id >= 0;
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            toast(ok ? "資料を追加しました" : "読み込めませんでした（対応形式：EPUB / TXT / MD）");
+                        }
+                    });
+                } catch (Throwable t) {
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            toast("読み込みに失敗しました");
+                        }
+                    });
+                }
+            }
+        }, new Runnable() {
+            @Override
+            public void run() {
+                if (currentNb == nb) showNotebook(nb, currentTitle, 0);
+            }
+        });
+    }
+
+    /** Web search screen: query the web seat, list hits, and add a
+     *  hit's page as a source of the current notebook. */
+    private void showWebSearch() {
+        clearScreen();
+        LinearLayout head = new LinearLayout(this);
+        head.setOrientation(LinearLayout.HORIZONTAL);
+        head.setGravity(Gravity.CENTER_VERTICAL);
+        TextView back = text("←", ssp(20), ink, false, false);
+        back.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showNotebook(currentNb, currentTitle, 0);
+            }
+        });
+        head.addView(back);
+        TextView t = text("Webで探す", ssp(19), ink, false, true);
+        LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        tp.leftMargin = dp(10);
+        t.setLayoutParams(tp);
+        head.addView(t);
+        screen.addView(head);
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        final EditText q = new EditText(this);
+        q.setHint("検索のことば");
+        q.setTextColor(ink);
+        q.setHintTextColor(sub);
+        GradientDrawable fieldBg = new GradientDrawable();
+        fieldBg.setColor(surface);
+        fieldBg.setCornerRadius(dp(20));
+        fieldBg.setStroke(1, hairline);
+        q.setBackground(fieldBg);
+        q.setPadding(dp(14), dp(8), dp(14), dp(8));
+        q.setLayoutParams(new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        row.addView(q);
+        final Button go = pillBtn("検索");
+        LinearLayout.LayoutParams gp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        gp.leftMargin = dp(8);
+        go.setLayoutParams(gp);
+        row.addView(go);
+        screen.addView(row, matchWrap(14));
+
+        final LinearLayout results = column();
+        screen.addView(results, matchWrap(10));
+        final long nb = currentNb;
+        go.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                final String query = q.getText().toString().trim();
+                if (query.isEmpty()) return;
+                go.setEnabled(false);
+                results.removeAllViews();
+                results.addView(text("検索中…", 14, sub, false, false));
+                final String[] raw = new String[1];
+                runBg(new Runnable() {
+                    @Override
+                    public void run() {
+                        raw[0] = Bridge.webSearch(query);
+                    }
+                }, new Runnable() {
+                    @Override
+                    public void run() {
+                        go.setEnabled(true);
+                        results.removeAllViews();
+                        if (raw[0] != null && raw[0].startsWith("ERR:")) {
+                            results.addView(text(raw[0].substring(4).trim(),
+                                    14, sub, false, false));
+                            return;
+                        }
+                        String[][] hits = lines(raw[0]);
+                        if (hits.length == 0) {
+                            results.addView(text("見つかりませんでした。",
+                                    14, sub, false, false));
+                            return;
+                        }
+                        for (final String[] hit : hits) {
+                            if (hit.length < 2) continue;
+                            LinearLayout card = column();
+                            card.setBackground(cardBg());
+                            card.setPadding(dp(14), dp(10), dp(14), dp(10));
+                            card.addView(text(unesc(hit[0]), 15, ink, false, false));
+                            card.addView(text(unesc(hit[1]), 12, sub, false, false));
+                            if (hit.length > 2 && !hit[2].isEmpty()) {
+                                card.addView(text(unesc(hit[2]), 12, sub, false, false));
+                            }
+                            card.addView(text("タップで資料に追加", 12, sub, false, false));
+                            card.setOnClickListener(new View.OnClickListener() {
+                                @Override
+                                public void onClick(View v) {
+                                    toast("ページを取り込んでいます…");
+                                    final String[] res = new String[1];
+                                    runBg(new Runnable() {
+                                        @Override
+                                        public void run() {
+                                            res[0] = Bridge.addWebSource(nb,
+                                                    unesc(hit[0]), unesc(hit[1]));
+                                        }
+                                    }, new Runnable() {
+                                        @Override
+                                        public void run() {
+                                            if (res[0] != null && res[0].startsWith("OK")) {
+                                                toast("資料を追加しました");
+                                                showNotebook(nb, currentTitle, 0);
+                                            } else {
+                                                toast("取り込めませんでした");
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                            results.addView(card, matchWrap(10));
+                        }
+                    }
+                });
+            }
+        });
     }
 
     // ---------- nb4: Studio (audio overview only; generation is stage 7) ----------
