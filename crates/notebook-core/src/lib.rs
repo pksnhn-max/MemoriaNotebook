@@ -513,6 +513,13 @@ impl CoreState {
     /// retrieve grounding chunks, build the citation-bound prompt,
     /// generate, validate citations, and record both turns. On any
     /// embedder or generator error nothing is recorded.
+    ///
+    /// Citation gate (ruled 2026-11-18): when grounding chunks exist
+    /// but the generated answer carries no valid citation, the prompt
+    /// is rebuilt once, sterner, and generation retried; if the retry
+    /// also yields no valid citation, the recorded answer is the
+    /// fixed refusal 「資料にありません。」. The gate counts validated
+    /// citations only — never the model's own claim of grounding.
     pub fn ask(
         &mut self,
         nb: u64,
@@ -544,10 +551,25 @@ impl CoreState {
         );
 
         // 4. 生成
-        let generated_text = generator.generate(&prompt)?;
+        let mut generated_text = generator.generate(&prompt)?;
 
         // 5. 検証（parse_citations）
-        let citations = parse_citations(&generated_text, &hits);
+        let mut citations = parse_citations(&generated_text, &hits);
+
+        // 5b. 出典の門：根拠の断片があるのに有効な出典が一つも無い
+        // 答えは、そのまま通さない。一度だけプロンプトを組み直して
+        // 再生成し、それでも出典が無ければ固定の拒否文を答えとする。
+        if citations.is_empty() && !hits.is_empty() {
+            let retry_prompt = format!(
+                "前回の回答は出典の印が一つも無かったため却下されました。資料の断片だけを使って答え直してください。主張する文の末尾には、根拠にした断片の印 [#番号] を必ずそのまま書いてください。断片の中に答えが無ければ「資料にありません」とだけ答えてください。\n\n資料:\n{}\n\n質問:\n{}",
+                grounding, question
+            );
+            generated_text = generator.generate(&retry_prompt)?;
+            citations = parse_citations(&generated_text, &hits);
+            if citations.is_empty() {
+                generated_text = "資料にありません。".to_string();
+            }
+        }
 
         // 6. ターン記録（ユーザー → アシスタント）
         let user_turn = ChatTurn {
@@ -1463,6 +1485,48 @@ mod tests {
         }
     }
 
+    /// Returns queued answers in order; counts the calls so gate
+    /// tests can prove whether a retry happened.
+    struct SeqGenerator {
+        answers: std::collections::VecDeque<String>,
+        calls: usize,
+    }
+
+    impl SeqGenerator {
+        fn new(answers: &[&str]) -> Self {
+            SeqGenerator {
+                answers: answers.iter().map(|s| s.to_string()).collect(),
+                calls: 0,
+            }
+        }
+    }
+
+    impl Generator for SeqGenerator {
+        fn generate(&mut self, _prompt: &str) -> CoreResult<String> {
+            self.calls += 1;
+            Ok(self
+                .answers
+                .pop_front()
+                .expect("SeqGenerator ran out of answers"))
+        }
+    }
+
+    /// Answers once, then errors — for the gate's retry-error path.
+    struct FailOnSecondGenerator {
+        calls: usize,
+    }
+
+    impl Generator for FailOnSecondGenerator {
+        fn generate(&mut self, _prompt: &str) -> CoreResult<String> {
+            self.calls += 1;
+            if self.calls == 1 {
+                Ok("出典のない答えです。".to_string())
+            } else {
+                Err(CoreError::GeneratorError("retry boom".into()))
+            }
+        }
+    }
+
     fn ask_fixture(dir: &std::path::Path) -> (CoreState, u64, u64) {
         let mut st = CoreState::new(dir, EngineCfg::default(), "m").unwrap();
         let nb = st.create_notebook("NB", 1).unwrap();
@@ -1501,6 +1565,69 @@ mod tests {
         drop(st);
         let st2 = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
         assert_eq!(st2.turns_of(nb_id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn ask_gate_retries_once_and_accepts_cited_retry() {
+        let dir = temp_dir();
+        let (mut st, nb_id, _src_id) = ask_fixture(&dir);
+        let mut emb = FakeEmbedder::new(32);
+        // Learn a real chunk id to cite in the retry answer.
+        let top = st.search(nb_id, &emb.embed("猫 魚").unwrap(), 1);
+        let cited = format!("答えです[#{}]", top[0].0.id);
+        let mut gen = SeqGenerator::new(&["出典のない答えです。", &cited]);
+        let turn = st.ask(nb_id, "猫 魚", &mut emb, &mut gen, 2, 10).unwrap();
+        assert_eq!(gen.calls, 2, "gate must retry exactly once");
+        assert_eq!(turn.text, cited);
+        assert_eq!(turn.citations.len(), 1);
+        // Only the accepted answer is recorded.
+        let turns = st.turns_of(nb_id).unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[1].text, cited);
+    }
+
+    #[test]
+    fn ask_gate_refuses_when_retry_also_uncited() {
+        let dir = temp_dir();
+        let (mut st, nb_id, _src_id) = ask_fixture(&dir);
+        let mut emb = FakeEmbedder::new(32);
+        let mut gen = SeqGenerator::new(&[
+            "自前知識で答えます。",
+            "やはり出典なしで答えます。",
+        ]);
+        let turn = st.ask(nb_id, "猫 魚", &mut emb, &mut gen, 2, 10).unwrap();
+        assert_eq!(gen.calls, 2);
+        assert_eq!(turn.text, "資料にありません。");
+        assert!(turn.citations.is_empty());
+        let turns = st.turns_of(nb_id).unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[1].text, "資料にありません。");
+    }
+
+    #[test]
+    fn ask_gate_retry_error_records_nothing() {
+        let dir = temp_dir();
+        let (mut st, nb_id, _src_id) = ask_fixture(&dir);
+        let mut emb = FakeEmbedder::new(32);
+        let mut gen = FailOnSecondGenerator { calls: 0 };
+        let r = st.ask(nb_id, "猫 魚", &mut emb, &mut gen, 2, 10);
+        assert_eq!(gen.calls, 2, "first answer uncited, retry attempted");
+        assert!(matches!(r, Err(CoreError::GeneratorError(_))));
+        assert_eq!(st.turns_of(nb_id).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn ask_gate_passes_cited_first_answer_without_retry() {
+        let dir = temp_dir();
+        let (mut st, nb_id, _src_id) = ask_fixture(&dir);
+        let mut emb = FakeEmbedder::new(32);
+        let top = st.search(nb_id, &emb.embed("猫 魚").unwrap(), 1);
+        let cited = format!("最初から出典付き[#{}]", top[0].0.id);
+        let mut gen = SeqGenerator::new(&[&cited]);
+        let turn = st.ask(nb_id, "猫 魚", &mut emb, &mut gen, 2, 10).unwrap();
+        assert_eq!(gen.calls, 1, "cited answer must not trigger a retry");
+        assert_eq!(turn.text, cited);
+        assert_eq!(turn.citations.len(), 1);
     }
 
     #[test]
