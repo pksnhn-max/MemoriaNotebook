@@ -237,6 +237,7 @@ public final class MainActivity extends Activity {
                 screen.addView(text("核の初期化に失敗しました。", 15, ink, false, false));
                 return;
             }
+            seedFixtureIfPresent();
         } catch (Throwable t) {
             screen.addView(text("初期化で例外: " + t, 15, ink, false, false));
             return;
@@ -1553,5 +1554,104 @@ private void showSettings() {
         body.addView(done, matchWrap(16));
         TextView none = text("まだ音声概要はありません。", 13, sub, false, false);
         body.addView(none, matchWrap(6));
+    }
+
+private void seedFixtureIfPresent() {
+        runBg(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    // 1. Check GGUF asset existence
+                    java.io.InputStream testIn = null;
+                    try {
+                        testIn = getAssets().open("fixture/tinyswallow-1.5b-instruct-q5_k_m.gguf");
+                    } catch (java.io.IOException e) {
+                        // production build: asset absent
+                        return;
+                    } finally {
+                        if (testIn != null) try { testIn.close(); } catch (java.io.IOException ignored) {}
+                    }
+
+                    // 2. Copy GGUF to filesDir/models if not already present
+                    java.io.File modelsDir = new java.io.File(getFilesDir(), "models");
+                    if (!modelsDir.exists()) modelsDir.mkdirs();
+                    java.io.File ggufOut = new java.io.File(modelsDir, "tinyswallow-1.5b-instruct-q5_k_m.gguf");
+                    if (!ggufOut.exists()) {
+                        java.io.InputStream in = null;
+                        java.io.FileOutputStream fos = null;
+                        try {
+                            in = getAssets().open("fixture/tinyswallow-1.5b-instruct-q5_k_m.gguf");
+                            fos = new java.io.FileOutputStream(ggufOut);
+                            byte[] buf = new byte[65536];
+                            int r;
+                            while ((r = in.read(buf)) > 0) {
+                                fos.write(buf, 0, r);
+                            }
+                        } catch (java.io.IOException e) {
+                            // ignore, leave file possibly incomplete
+                        } finally {
+                            if (in != null) try { in.close(); } catch (java.io.IOException ignored) {}
+                            if (fos != null) try { fos.close(); } catch (java.io.IOException ignored) {}
+                        }
+                    }
+
+                    // 3. EPUB seeding with marker
+                    java.io.File marker = new java.io.File(getFilesDir(), "fixture_seeded");
+                    if (marker.exists()) {
+                        return;
+                    }
+
+                    // Check EPUB asset
+                    java.io.InputStream epubIn = null;
+                    try {
+                        epubIn = getAssets().open("fixture/kokka-to-kakumei-ch1.epub");
+                    } catch (java.io.IOException e) {
+                        // EPUB not present in this build
+                        return;
+                    }
+
+                    // Read EPUB fully into memory
+                    byte[] epubBytes;
+                    try {
+                        java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+                        byte[] buf = new byte[65536];
+                        int r;
+                        while ((r = epubIn.read(buf)) > 0) {
+                            baos.write(buf, 0, r);
+                        }
+                        epubBytes = baos.toByteArray();
+                    } catch (java.io.IOException e) {
+                        try { epubIn.close(); } catch (java.io.IOException ignored) {}
+                        return;
+                    } finally {
+                        try { epubIn.close(); } catch (java.io.IOException ignored) {}
+                    }
+
+                    // Create notebook and add file source via Bridge
+                    long nbId = Bridge.createNotebook("国家と革命（テスト）", System.currentTimeMillis() / 1000);
+                    if (nbId > 0) {
+                        Bridge.addFileSource(nbId, "国家と革命 第1章", "epub", epubBytes);
+                    }
+
+                    // Write marker file (empty) to indicate seeding done
+                    java.io.FileOutputStream markerFos = null;
+                    try {
+                        markerFos = new java.io.FileOutputStream(marker);
+                        markerFos.write(new byte[0]);
+                    } catch (java.io.IOException e) {
+                        // marker not created; next launch will retry
+                    } finally {
+                        if (markerFos != null) try { markerFos.close(); } catch (java.io.IOException ignored) {}
+                    }
+                } catch (Throwable t) {
+                    // never crash
+                }
+            }
+        }, new Runnable() {
+            @Override
+            public void run() {
+                // no UI callback needed
+            }
+        });
     }
 }
