@@ -54,7 +54,7 @@ impl Generator for LlamaGenerator {
         // dressing it for the model is this seat's job.
         let dressed = format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n");
         let tokens = vocab.tokenize(dressed.as_bytes(), true, true);
-        if tokens.len() > 4096 - 64 {
+        if tokens.len() + self.max_tokens > 4096 {
             return Err(CoreError::GeneratorError(
                 "prompt too long for context".to_string(),
             ));
@@ -93,6 +93,11 @@ impl Generator for LlamaGenerator {
             n_cur += 1;
             ctx.decode(&mut batch).map_err(cerr("decode gen"))?;
         }
+        // Flush the decoder so a trailing partial sequence surfaces
+        // (as U+FFFD) instead of vanishing.
+        let mut tail = String::new();
+        decoder.decode_to_string(&[], &mut tail, true);
+        out.push_str(&tail);
         Ok(out.trim().to_string())
     }
 }

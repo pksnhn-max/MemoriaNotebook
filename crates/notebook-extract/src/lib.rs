@@ -58,8 +58,26 @@ pub fn html_to_text(html: &str) -> String {
     let lb = lower.as_bytes();
     while i < b.len() {
         if b[i] == b'<' {
-            // Find the end of the tag.
-            let Some(end) = find_byte(b, i, b'>') else { break };
+            // Find the end of the tag, skipping '>' inside quoted
+            // attribute values.
+            let mut end = None;
+            let mut quote = 0u8;
+            let mut j = i + 1;
+            while j < b.len() {
+                let c = b[j];
+                if quote != 0 {
+                    if c == quote {
+                        quote = 0;
+                    }
+                } else if c == b'"' || c == b'\'' {
+                    quote = c;
+                } else if c == b'>' {
+                    end = Some(j);
+                    break;
+                }
+                j += 1;
+            }
+            let Some(end) = end else { break };
             let tag = &lower[i + 1..end];
             let name: String = tag
                 .trim_start_matches('/')
@@ -95,12 +113,28 @@ pub fn html_to_text(html: &str) -> String {
                 continue;
             };
             let ent = &html[i + 1..end];
+            // Numeric entities (&#123; / &#x1F600;) decode to their char.
+            let numeric = if let Some(num) = ent.strip_prefix('#') {
+                let v = if let Some(hex) = num.strip_prefix('x').or(num.strip_prefix('X')) {
+                    u32::from_str_radix(hex, 16).ok()
+                } else {
+                    num.parse::<u32>().ok()
+                };
+                v.and_then(char::from_u32)
+            } else {
+                None
+            };
+            if let Some(c) = numeric {
+                out.push(c);
+                i = end + 1;
+                continue;
+            }
             let decoded = match ent {
                 "amp" => Some("&"),
                 "lt" => Some("<"),
                 "gt" => Some(">"),
                 "quot" => Some("\""),
-                "apos" | "#39" => Some("'"),
+                "apos" => Some("'"),
                 "nbsp" => Some(" "),
                 _ => None,
             };
@@ -309,6 +343,8 @@ const BLOCK_TAGS: &[&[u8]] = &[
     b"section",
     b"article",
     b"blockquote",
+    b"td",
+    b"th",
 ];
 
 fn xhtml_to_text(xml: &[u8]) -> String {
@@ -378,6 +414,14 @@ mod tests {
     #[test]
     fn utf8_txt_passthrough() {
         assert_eq!(extract_txt("天満川の水位".as_bytes()), "天満川の水位");
+    }
+
+    #[test]
+    fn html_entities_and_quoted_gt() {
+        let html = "<html><body><p title=\"a>b\">天満川&#12398;水位 &amp; 記録</p><script>var x=1;</script></body></html>";
+        let text = html_to_text(html);
+        assert!(text.contains("天満川の水位 & 記録"), "{text}");
+        assert!(!text.contains("var x"), "{text}");
     }
 
     #[test]

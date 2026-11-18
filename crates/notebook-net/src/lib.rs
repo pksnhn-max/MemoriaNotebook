@@ -36,6 +36,7 @@ fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(20))
         .timeout_read(std::time::Duration::from_secs(120))
+        .timeout_write(std::time::Duration::from_secs(30))
         .user_agent(UA)
         .build()
 }
@@ -281,7 +282,19 @@ fn hex(b: u8) -> Option<u8> {
 }
 
 pub fn hf_resolve_url(repo: &str, file: &str) -> String {
-    format!("https://huggingface.co/{repo}/resolve/main/{file}")
+    // Encode each path segment (file names may carry spaces etc.);
+    // '/' separators between segments stay literal.
+    let enc = |s: &str| {
+        s.split('/')
+            .map(|seg| percent_encode(seg.as_bytes()))
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+    format!(
+        "https://huggingface.co/{}/resolve/main/{}",
+        enc(repo),
+        enc(file)
+    )
 }
 
 /// Search Hugging Face for GGUF model repos matching `query`.

@@ -248,6 +248,12 @@ public final class MainActivity extends Activity {
     }
 
     @Override
+    protected void onDestroy() {
+        bg.shutdownNow();
+        super.onDestroy();
+    }
+
+    @Override
     protected void onSaveInstanceState(Bundle out) {
         super.onSaveInstanceState(out);
         out.putLong("nb", currentNb);
@@ -1253,6 +1259,7 @@ public final class MainActivity extends Activity {
         final LinearLayout results = column();
         screen.addView(results, matchWrap(10));
         final long nb = currentNb;
+        final String nbTitle = currentTitle;
         go.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -1310,7 +1317,7 @@ public final class MainActivity extends Activity {
                                         public void run() {
                                             if (res[0] != null && res[0].startsWith("OK")) {
                                                 toast("資料を追加しました");
-                                                showNotebook(nb, currentTitle, 0);
+                                                showNotebook(nb, nbTitle, 0);
                                             } else {
                                                 toast("取り込めませんでした");
                                             }

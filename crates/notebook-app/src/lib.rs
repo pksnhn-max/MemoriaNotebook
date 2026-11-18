@@ -1,4 +1,4 @@
-//! Stage 6a scaffold: the Android vessel's Rust side.
+//! The Android vessel's Rust side (stages 6a-6d).
 //!
 //! A thin JNI bridge over `notebook-core`. The Kotlin host owns one
 //! Activity and calls these functions; all state lives in one
@@ -411,7 +411,11 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_ask(
                 }
             }
         }
-        let gen = h.gen.as_mut().expect("generator loaded above");
+        let Some(gen) = h.gen.as_mut() else {
+            return Err(notebook_core::CoreError::GeneratorError(
+                "generator seat empty after load".to_string(),
+            ));
+        };
         let turn: ChatTurn =
             h.core
                 .ask(nb as u64, &question, &mut *h.emb, gen, 5, 0)?;
@@ -493,6 +497,36 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_downloadModel(
     let result = (|| -> Result<String, String> {
         let repo = jstring_to_string(&mut env, &repo)?;
         let file = jstring_to_string(&mut env, &file)?;
+        // The file name lands on disk under the models dir: it must
+        // be a plain file name, never a path (no traversal).
+        if file.is_empty()
+            || file.contains('/')
+            || file.contains('\\')
+            || file.contains("..")
+        {
+            return Err("invalid model file name".to_string());
+        }
+        // One download at a time (the .part staging file is shared).
+        static DOWNLOADING: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if DOWNLOADING
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return Err("download already in progress".to_string());
+        }
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                DOWNLOADING.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _guard = Guard;
         let data_dir = {
             let guard = STATE.lock().map_err(|_| "state poisoned".to_string())?;
             let host = guard.as_ref().ok_or("not initialized")?;
