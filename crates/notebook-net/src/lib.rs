@@ -89,6 +89,20 @@ pub struct SearchHit {
 /// is a replaceable part: settings can point at any SearXNG host.
 pub const DEFAULT_SEARX_INSTANCE: &str = "https://searx.be";
 
+/// SearXNG instances tried in order when DuckDuckGo yields nothing.
+/// Public instances come and go and toggle their JSON API (searx.be
+/// disabled it — an HTML page came back where JSON was expected,
+/// which surfaced on device as "parse: searx json"); the chain treats
+/// a dead or non-JSON instance as a skip, never as the final error
+/// unless every provider failed. Swap entries here as the public
+/// instance landscape changes — this list is the provider seam.
+pub const SEARX_INSTANCES: &[&str] = &[
+    "https://searx.be",
+    "https://search.bus-hit.me",
+    "https://searxng.site",
+    "https://priv.au",
+];
+
 /// Web search (no key). Provider order: DuckDuckGo HTML first; when
 /// it yields nothing (bot walls refuse datacenter clients), fall back
 /// to a SearXNG instance's JSON API. Returns up to `n` hits with
@@ -96,7 +110,32 @@ pub const DEFAULT_SEARX_INSTANCE: &str = "https://searx.be";
 pub fn search_web(query: &str, n: usize) -> Result<Vec<SearchHit>, NetError> {
     match search_web_ddg(query, n) {
         Ok(hits) if !hits.is_empty() => Ok(hits),
-        _ => search_web_searx(DEFAULT_SEARX_INSTANCE, query, n),
+        _ => search_web_chain(query, n, SEARX_INSTANCES),
+    }
+}
+
+/// Try each SearXNG instance in order. An instance that errors or
+/// answers without JSON is skipped; the search only fails when every
+/// instance failed, and then with the last error seen. An instance
+/// that answers with zero hits is a legitimate empty answer.
+pub fn search_web_chain(
+    query: &str,
+    n: usize,
+    instances: &[&str],
+) -> Result<Vec<SearchHit>, NetError> {
+    let mut last_err: Option<NetError> = None;
+    let mut any_answer = false;
+    for inst in instances {
+        match search_web_searx(inst, query, n) {
+            Ok(hits) if !hits.is_empty() => return Ok(hits),
+            Ok(_) => any_answer = true,
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if any_answer {
+        Ok(Vec::new())
+    } else {
+        Err(last_err.unwrap_or(NetError::Parse("no search provider answered")))
     }
 }
 
@@ -388,5 +427,19 @@ mod tests {
         assert_eq!(n, 10_000);
         assert_eq!(std::fs::metadata(&dest).unwrap().len(), 10_000);
         let _ = std::fs::remove_file(dest);
+        // Chain: the first "instance" serves an HTML page where JSON
+        // was expected (the searx.be failure mode) and must be
+        // skipped; the second serves real SearXNG JSON.
+        let hits = search_web_chain(
+            "tenma",
+            5,
+            &[&format!("{base}/htmlonly"), &format!("{base}/searx")],
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].url, "https://example.com/tenma");
+        // Every instance failing surfaces the last error.
+        let err = search_web_chain("tenma", 5, &[&format!("{base}/htmlonly")]);
+        assert!(err.is_err());
     }
 }
