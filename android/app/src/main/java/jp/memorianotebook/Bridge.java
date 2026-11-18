@@ -44,4 +44,19 @@ public final class Bridge {
     public static native String getApiConfig();
     /** Fetch available models from API endpoint; JSON array of ids or {"error":"..."}. */
     public static native String fetchApiModels(String baseUrl, String apiKey);
+    /** Voice catalog as JSON: key/name/credit/termsUrl/sizeMb/vvmFile/installed/consented/isA/isB. */
+    public static native String getVoiceCatalog();
+    /** Record consent to one voice's terms. "OK" or ERR:. */
+    public static native String recordVoiceConsent(String key);
+    /** Download one voice's VVM from the official repo (blocking). "OK bytes" or ERR:. */
+    public static native String downloadVoice(String key);
+    /** Set the dialogue pair (host A / host B voice keys). "OK" or ERR:. */
+    public static native String setVoicePair(String a, String b);
+    /** Generate an audio overview (blocking): script via API, synthesis on-device.
+     *  Returns the summary record as JSON, or ERR:. */
+    public static native String generateVoiceSummary(long notebookId, String focus, String dictDir, String ortLib, long atMillis);
+    /** Audio summaries of one notebook as a JSON array, newest first. */
+    public static native String listVoiceSummaries(long notebookId);
+    /** Delete one audio summary and its WAV file. "OK" or ERR:. */
+    public static native String deleteVoiceSummary(long id);
 }

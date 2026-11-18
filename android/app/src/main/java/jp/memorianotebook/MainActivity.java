@@ -72,6 +72,10 @@ public final class MainActivity extends Activity {
     private String[][] hfRepos = new String[0][];
     private String hfFileRepo = "";
     private String[][] hfFiles = new String[0][];
+    private final java.util.Set<String> voiceDownloading = new java.util.HashSet<>();
+    private android.media.MediaPlayer player;
+    private android.os.Handler playerHandler;
+    private Runnable playerTick;
 
     /** Run JNI work that can block (generation, downloads, fetches)
      *  off the UI thread, then finish back on it. */
@@ -716,6 +720,7 @@ private void showSettings() {
 
         // Prefill from config
         prefillFromCfg(cfg[0], baseUrl, apiKey, modelName, localLabel, apiLabel);
+        buildVoiceSettings();
 
         screen.addView(text("ローカルモデル", 13, sub, false, true), matchWrap(16));
         LinearLayout model = column();
@@ -1032,13 +1037,42 @@ private void showSettings() {
         card.addView(t);
         String meta = srcCount + " 件のソース"
                 + (created.equals("0") ? "" : " ・ " + dateOf(Long.parseLong(created)));
+        LinearLayout metaRow = new LinearLayout(this);
+        metaRow.setOrientation(LinearLayout.HORIZONTAL);
+        metaRow.setGravity(Gravity.CENTER_VERTICAL);
         TextView m = text(meta, 12, sub, false, false);
+        m.setLayoutParams(new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        metaRow.addView(m);
+        // nb1 v3: the play button appears only on notebooks that
+        // have an audio overview; it opens the newest one.
+        final org.json.JSONObject[] latest = new org.json.JSONObject[1];
+        try {
+            String sums = Bridge.listVoiceSummaries(id);
+            if (sums != null && !sums.startsWith("ERR:")) {
+                org.json.JSONArray arr = new org.json.JSONArray(sums);
+                if (arr.length() > 0) latest[0] = arr.getJSONObject(0);
+            }
+        } catch (Throwable ignored) {}
+        if (latest[0] != null) {
+            TextView play = text("▶", 15, ink, false, false);
+            play.setPadding(dp(10), dp(4), dp(2), dp(4));
+            play.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    currentNb = id;
+                    currentTitle = title;
+                    showPlayer(latest[0]);
+                }
+            });
+            metaRow.addView(play);
+        }
         LinearLayout.LayoutParams mp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT);
         mp.topMargin = dp(18);
-        m.setLayoutParams(mp);
-        card.addView(m);
+        metaRow.setLayoutParams(mp);
+        card.addView(metaRow);
         card.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -1723,37 +1757,712 @@ private void showSettings() {
 
     // ---------- nb4: Studio (audio overview only; generation is stage 7) ----------
 
-    private void buildStudio(LinearLayout body) {
+private void buildStudio(LinearLayout body) {
         body.addView(text("Studio", 15, ink, false, true));
+
         LinearLayout card = column();
         card.setBackground(cardBg());
         card.setPadding(dp(14), dp(12), dp(14), dp(12));
-        card.addView(text("音声概要", 13, sub, false, false));
-        TextView big = text("ソースを、二人の対話で聴く", 18, ink, true, true);
-        LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT);
-        bp.topMargin = dp(6);
-        big.setLayoutParams(bp);
-        card.addView(big);
-        TextView desc = text("選択中のソースから、対話形式の音声を生成します。"
-                + "台本は API のモデルが書きます（未設定のときは設定へ案内します）。"
-                + "生成機能は準備中です。", 13, sub, false, false);
-        LinearLayout.LayoutParams dsp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT);
-        dsp.topMargin = dp(6);
-        desc.setLayoutParams(dsp);
-        card.addView(desc);
-        Button gen = pillBtn("生成する");
-        gen.setEnabled(false);
-        card.addView(gen, matchWrap(10));
-        body.addView(card, matchWrap(10));
+        body.addView(card, matchWrap(0));
 
-        TextView done = text("生成済み", 14, ink, false, true);
-        body.addView(done, matchWrap(16));
-        TextView none = text("まだ音声概要はありません。", 13, sub, false, false);
-        body.addView(none, matchWrap(6));
+        card.addView(text("音声概要", 13, sub, false, false));
+        card.addView(text("ソースを、二人の対話で聴く", 18, ink, true, true));
+        card.addView(text("選択中のソースから、対話形式の音声を生成します。台本は API のモデルが書き、合成は端末の中で行います。", 13, sub, false, false));
+
+        String aName = "", bName = "";
+        try {
+            org.json.JSONArray catalog = new org.json.JSONArray(Bridge.getVoiceCatalog());
+            for (int i = 0; i < catalog.length(); i++) {
+                org.json.JSONObject v = catalog.getJSONObject(i);
+                if (v.optBoolean("isA")) aName = v.optString("name", v.optString("key", ""));
+                if (v.optBoolean("isB")) bName = v.optString("name", v.optString("key", ""));
+            }
+        } catch (Exception ignored) {}
+        if (aName.isEmpty()) aName = "A";
+        if (bName.isEmpty()) bName = "B";
+
+        LinearLayout voiceRow = new LinearLayout(this);
+        voiceRow.setOrientation(LinearLayout.HORIZONTAL);
+        voiceRow.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        voiceRow.addView(text("声", 12, sub, false, false));
+        voiceRow.addView(text(aName + "／" + bName, 13, ink, false, true), new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+        TextView chev = text("›", 16, sub, false, false);
+        voiceRow.addView(chev);
+        voiceRow.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { showSettings(); }
+        });
+        card.addView(voiceRow, matchWrap(8));
+
+        final EditText focusEt = new EditText(this);
+        focusEt.setHint("焦点（任意）：例「水門の整備史を中心に」");
+        focusEt.setTextColor(ink);
+        focusEt.setBackgroundColor(android.graphics.Color.TRANSPARENT);
+        focusEt.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13);
+        focusEt.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+        focusEt.setGravity(android.view.Gravity.TOP | android.view.Gravity.START);
+        focusEt.setPadding(dp(12), dp(8), dp(12), dp(8));
+        focusEt.setLayoutParams(new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(56)));
+
+        final Button genBtn = pillBtn("生成する");
+        LinearLayout.LayoutParams btnLp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        btnLp.topMargin = dp(8);
+        card.addView(genBtn, btnLp);
+
+        final TextView statusTv = text("", 12, sub, false, false);
+        statusTv.setVisibility(View.GONE);
+        card.addView(statusTv, matchWrap(4));
+
+        genBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                genBtn.setEnabled(false);
+                statusTv.setText("生成中…");
+                statusTv.setVisibility(View.VISIBLE);
+                final String focus = focusEt.getText().toString().trim();
+                final String dictDir = new java.io.File(getFilesDir(), "open_jtalk_dic").getAbsolutePath();
+                final String ortLib = getApplicationInfo().nativeLibraryDir + "/libvoicevox_onnxruntime.so";
+                final long at = System.currentTimeMillis();
+                runBg(new Runnable() {
+                    @Override public void run() {
+                        ensureVoiceDict();
+                        final String res = Bridge.generateVoiceSummary(currentNb, focus, dictDir, ortLib, at);
+                        runOnUiThread(new Runnable() {
+                            @Override public void run() {
+                                genBtn.setEnabled(true);
+                                statusTv.setVisibility(View.GONE);
+                                if (res.startsWith("ERR:")) {
+                                    toast(res.substring(4).trim());
+                                } else {
+                                    toast("音声概要を生成しました");
+                                }
+                                showNotebook(currentNb, currentTitle, 2);
+                            }
+                        });
+                    }
+                }, null);
+            }
+        });
+
+        LinearLayout focusCard = column();
+        focusCard.setBackground(cardBg());
+        focusCard.setPadding(dp(14), dp(6), dp(14), dp(6));
+        focusCard.addView(focusEt);
+        body.addView(focusCard, matchWrap(10));
+
+        body.addView(text("生成済み", 14, ink, false, true), matchWrap(16));
+
+        String listJson = Bridge.listVoiceSummaries(currentNb);
+        try {
+            org.json.JSONArray arr = new org.json.JSONArray(listJson);
+            if (arr.length() == 0) {
+                body.addView(text("まだ音声概要はありません。", 13, sub, false, false), matchWrap(8));
+            } else {
+                for (int i = 0; i < arr.length(); i++) {
+                    final org.json.JSONObject rec = arr.getJSONObject(i);
+                    LinearLayout row = new LinearLayout(this);
+                    row.setBackground(cardBg());
+                    row.setOrientation(LinearLayout.HORIZONTAL);
+                    row.setGravity(android.view.Gravity.CENTER_VERTICAL);
+                    row.setPadding(dp(12), dp(10), dp(12), dp(10));
+
+                    TextView playTv = text("▶", 16, ink, false, false);
+                    LinearLayout.LayoutParams playLp = new LinearLayout.LayoutParams(dp(36), dp(36));
+                    playLp.rightMargin = dp(10);
+                    row.addView(playTv, playLp);
+
+                    LinearLayout infoCol = column();
+                    infoCol.addView(text(rec.optString("title", ""), 15, ink, false, true));
+                    String subText = "音声概要 ・ " + fmtDur(rec.optDouble("durationSec", 0)) + " ・ " + dateOf(rec.optLong("createdAt", 0));
+                    infoCol.addView(text(subText, 12, sub, false, false));
+                    LinearLayout.LayoutParams infoLp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1);
+                    row.addView(infoCol, infoLp);
+
+                    TextView menuTv = text("⋮", 18, sub, false, false);
+                    menuTv.setPadding(dp(8), 0, 0, 0);
+                    menuTv.setOnClickListener(new View.OnClickListener() {
+                        @Override public void onClick(View v) {
+                            new android.app.AlertDialog.Builder(MainActivity.this)
+                                .setItems(new CharSequence[]{"削除"}, new android.content.DialogInterface.OnClickListener() {
+                                    @Override public void onClick(android.content.DialogInterface dialog, int which) {
+                                        runBg(new Runnable() {
+                                            @Override public void run() {
+                                                Bridge.deleteVoiceSummary(rec.optLong("id", 0));
+                                                runOnUiThread(new Runnable() {
+                                                    @Override public void run() {
+                                                        showNotebook(currentNb, currentTitle, 2);
+                                                    }
+                                                });
+                                            }
+                                        }, null);
+                                    }
+                                })
+                                .show();
+                        }
+                    });
+                    row.addView(menuTv);
+
+                    row.setOnClickListener(new View.OnClickListener() {
+                        @Override public void onClick(View v) { showPlayer(rec); }
+                    });
+                    body.addView(row, matchWrap(8));
+                }
+            }
+        } catch (Exception e) {
+            body.addView(text("読み込みエラー", 13, sub, false, false), matchWrap(8));
+        }
+    }
+
+    private String fmtDur(double sec) {
+        long total = Math.round(sec);
+        long m = total / 60;
+        long s = total % 60;
+        return String.format(Locale.US, "%d:%02d", m, s);
+    }
+
+    private void showPlayer(final org.json.JSONObject rec) {
+        stopPlayer();
+        clearScreen();
+
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        header.setPadding(dp(12), dp(8), dp(12), dp(8));
+        TextView backTv = text("←", ssp(20), ink, false, false);
+        backTv.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                stopPlayer();
+                showNotebook(currentNb, currentTitle, 2);
+            }
+        });
+        header.addView(backTv);
+        header.addView(text("音声概要", ssp(19), ink, false, true), new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+        screen.addView(header);
+
+
+        TextView playerTitle = text(rec.optString("title", ""), 18, ink, true, true);
+        playerTitle.setGravity(android.view.Gravity.CENTER);
+        screen.addView(playerTitle, matchWrap(24));
+        TextView playerMeta = text("音声概要 ・ " + dateOf(rec.optLong("createdAt", 0)), 12, sub, false, false);
+        playerMeta.setGravity(android.view.Gravity.CENTER);
+        screen.addView(playerMeta, matchWrap(6));
+
+        String vaKey = rec.optString("voiceA", "");
+        String vbKey = rec.optString("voiceB", "");
+        String vaName = vaKey, vbName = vbKey;
+        try {
+            org.json.JSONArray catalog = new org.json.JSONArray(Bridge.getVoiceCatalog());
+            for (int i = 0; i < catalog.length(); i++) {
+                org.json.JSONObject v = catalog.getJSONObject(i);
+                String k = v.optString("key", "");
+                if (k.equals(vaKey)) vaName = v.optString("name", k);
+                if (k.equals(vbKey)) vbName = v.optString("name", k);
+            }
+        } catch (Exception ignored) {}
+
+        LinearLayout hosts = new LinearLayout(this);
+        hosts.setOrientation(LinearLayout.HORIZONTAL);
+        hosts.setGravity(android.view.Gravity.CENTER);
+        hosts.addView(text("A " + vaName, 12, sub, false, false));
+        TextView sep = text("  ・  ", 12, sub, false, false);
+        hosts.addView(sep);
+        hosts.addView(text("B " + vbName, 12, sub, false, false));
+        screen.addView(hosts, matchWrap(16));
+
+        final android.widget.SeekBar seek = new android.widget.SeekBar(this);
+        int durMs = (int) (rec.optDouble("durationSec", 0) * 1000);
+        seek.setMax(durMs);
+        LinearLayout.LayoutParams seekLp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        seekLp.leftMargin = dp(16);
+        seekLp.rightMargin = dp(16);
+        seekLp.topMargin = dp(16);
+        screen.addView(seek, seekLp);
+
+        LinearLayout timeRow = new LinearLayout(this);
+        timeRow.setOrientation(LinearLayout.HORIZONTAL);
+        final TextView curTv = text("0:00", 12, sub, false, false);
+        final TextView totTv = text(fmtDur(rec.optDouble("durationSec", 0)), 12, sub, false, false);
+        timeRow.addView(curTv);
+        timeRow.addView(new View(this), new LinearLayout.LayoutParams(0, 0, 1));
+        timeRow.addView(totTv);
+        timeRow.setPadding(dp(16), dp(4), dp(16), 0);
+        screen.addView(timeRow, matchWrap(0));
+
+        LinearLayout ctrlRow = new LinearLayout(this);
+        ctrlRow.setOrientation(LinearLayout.HORIZONTAL);
+        ctrlRow.setGravity(android.view.Gravity.CENTER);
+        ctrlRow.setPadding(0, dp(12), 0, dp(16));
+
+        final TextView speedTv = text("1.0x", 13, sub, false, false);
+        final float[] speeds = {0.75f, 1.0f, 1.25f, 1.5f};
+        final int[] speedIdx = {1};
+        speedTv.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                speedIdx[0] = (speedIdx[0] + 1) % speeds.length;
+                float sp = speeds[speedIdx[0]];
+                speedTv.setText(new String[]{"0.75x", "1.0x", "1.25x", "1.5x"}[speedIdx[0]]);
+                if (player != null) {
+                    android.media.PlaybackParams pp = player.getPlaybackParams();
+                    pp.setSpeed(sp);
+                    player.setPlaybackParams(pp);
+                }
+            }
+        });
+        ctrlRow.addView(speedTv);
+        ctrlRow.addView(new View(this), new LinearLayout.LayoutParams(dp(24), 0));
+
+        TextView rwTv = text("⏮", 15, ink, false, false);
+        rwTv.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                if (player != null) {
+                    try {
+                        int pos = player.getCurrentPosition() - 10000;
+                        if (pos < 0) pos = 0;
+                        player.seekTo(pos);
+                    } catch (Exception ignored) {}
+                }
+            }
+        });
+        ctrlRow.addView(rwTv);
+        ctrlRow.addView(new View(this), new LinearLayout.LayoutParams(dp(16), 0));
+
+        final TextView playPauseTv = text("⏸", 30, ink, false, false);
+        playPauseTv.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                if (player != null) {
+                    if (player.isPlaying()) {
+                        player.pause();
+                        playPauseTv.setText("▶");
+                    } else {
+                        try {
+                            player.start();
+                            playPauseTv.setText("⏸");
+                        } catch (Exception ignored) {}
+                    }
+                }
+            }
+        });
+        ctrlRow.addView(playPauseTv);
+        ctrlRow.addView(new View(this), new LinearLayout.LayoutParams(dp(16), 0));
+
+        TextView ffTv = text("⏭", 15, ink, false, false);
+        ffTv.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                if (player != null) {
+                    try {
+                        int pos = player.getCurrentPosition() + 10000;
+                        if (pos > player.getDuration()) pos = player.getDuration();
+                        player.seekTo(pos);
+                    } catch (Exception ignored) {}
+                }
+            }
+        });
+        ctrlRow.addView(ffTv);
+
+        screen.addView(ctrlRow, matchWrap(0));
+
+        final String wavFile = rec.optString("wavFile", "");
+        java.io.File f = new java.io.File(new java.io.File(getFilesDir(), "audio"), wavFile);
+        if (!f.exists()) {
+            toast("音声ファイルが見つかりません");
+            return;
+        }
+
+        player = new android.media.MediaPlayer();
+        playerHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+        try {
+            player.setDataSource(f.getAbsolutePath());
+            player.setOnCompletionListener(new android.media.MediaPlayer.OnCompletionListener() {
+                @Override public void onCompletion(android.media.MediaPlayer mp) {
+                    if (playerHandler != null && playerTick != null) {
+                        playerHandler.removeCallbacks(playerTick);
+                    }
+                    playPauseTv.setText("▶");
+                    seek.setProgress(0);
+                    curTv.setText("0:00");
+                }
+            });
+            seek.setOnSeekBarChangeListener(new android.widget.SeekBar.OnSeekBarChangeListener() {
+                boolean user = false;
+                @Override public void onStartTrackingTouch(android.widget.SeekBar sb) { user = true; }
+                @Override public void onStopTrackingTouch(android.widget.SeekBar sb) {
+                    user = false;
+                    if (player != null) {
+                        try { player.seekTo(sb.getProgress()); } catch (Exception ignored) {}
+                    }
+                }
+                @Override public void onProgressChanged(android.widget.SeekBar sb, int prog, boolean fromUser) {
+                    if (fromUser && player != null) {
+                        try { player.seekTo(prog); } catch (Exception ignored) {}
+                    }
+                }
+            });
+
+            playerTick = new Runnable() {
+                @Override public void run() {
+                    if (player != null) {
+                        int pos = player.getCurrentPosition();
+                        seek.setProgress(pos);
+                        curTv.setText(fmtDur(pos / 1000.0));
+                        playerHandler.postDelayed(this, 500);
+                    }
+                }
+            };
+            player.setOnPreparedListener(new android.media.MediaPlayer.OnPreparedListener() {
+                @Override public void onPrepared(android.media.MediaPlayer mp) {
+                    mp.start();
+                    playPauseTv.setText("⏸");
+                    playerHandler.post(playerTick);
+                }
+            });
+            player.prepareAsync();
+        } catch (Exception e) {
+            toast("再生準備エラー");
+            stopPlayer();
+        }
+    }
+
+    private void stopPlayer() {
+        if (playerHandler != null && playerTick != null) {
+            playerHandler.removeCallbacks(playerTick);
+        }
+        if (player != null) {
+            try {
+                if (player.isPlaying()) player.stop();
+            } catch (Exception ignored) {}
+            player.release();
+            player = null;
+        }
+    }
+
+    private void ensureVoiceDict() {
+        java.io.File dictDir = new java.io.File(getFilesDir(), "open_jtalk_dic");
+        java.io.File sysDic = new java.io.File(dictDir, "sys.dic");
+        if (sysDic.exists()) return;
+        if (!dictDir.mkdirs()) return;
+        try {
+            String[] assets = getAssets().list("open_jtalk_dic");
+            if (assets == null) return;
+            for (String name : assets) {
+                java.io.InputStream in = getAssets().open("open_jtalk_dic/" + name);
+                java.io.FileOutputStream out = new java.io.FileOutputStream(new java.io.File(dictDir, name));
+                byte[] buf = new byte[8192];
+                int len;
+                while ((len = in.read(buf)) > 0) out.write(buf, 0, len);
+                in.close();
+                out.close();
+            }
+        } catch (Exception ignored) {}
+    }
+
+private View voiceSlotRow(final String letter, final org.json.JSONObject entry,
+                              final boolean slotA, final org.json.JSONArray catalog) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        LinearLayout left = column();
+        String name = entry != null ? entry.optString("name", "未設定") : "未設定";
+        boolean installed = entry != null && entry.optBoolean("installed", false);
+        left.addView(text(name, 15, ink, false, true));
+        left.addView(text("ホスト " + letter + " ・ " + (installed ? "導入済み" : "未導入"), 12, sub, false, false));
+        row.addView(left, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        row.addView(text("›", 16, sub, false, false));
+        row.setOnClickListener(new android.view.View.OnClickListener() {
+            @Override public void onClick(android.view.View v) { pickVoiceForSlot(slotA, catalog); }
+        });
+        return row;
+    }
+
+    private void buildVoiceSettings() {
+        String json = Bridge.getVoiceCatalog();
+        if (json == null) return;
+        org.json.JSONArray catalog;
+        try {
+            catalog = new org.json.JSONArray(json);
+        } catch (org.json.JSONException e) {
+            return;
+        }
+
+        screen.addView(text("音声概要", 13, sub, false, true), matchWrap(16));
+
+        LinearLayout scriptCard = column();
+        scriptCard.setBackground(cardBg());
+        scriptCard.setPadding(dp(14), dp(12), dp(14), dp(12));
+        scriptCard.addView(text("台本", 15, ink, false, true), matchWrap(0));
+        scriptCard.addView(text("生成には API 設定が必要です。台本は API のモデルが書きます", 12, sub, false, false), matchWrap(4));
+        screen.addView(scriptCard, matchWrap(8));
+
+        screen.addView(text("対話の声", 13, sub, false, true), matchWrap(16));
+
+        String currentA = null;
+        String currentB = null;
+        org.json.JSONObject entryA = null;
+        org.json.JSONObject entryB = null;
+
+        for (int i = 0; i < catalog.length(); i++) {
+            try {
+                org.json.JSONObject v = catalog.getJSONObject(i);
+                if (v.optBoolean("isA", false)) {
+                    currentA = v.optString("key", "");
+                    entryA = v;
+                }
+                if (v.optBoolean("isB", false)) {
+                    currentB = v.optString("key", "");
+                    entryB = v;
+                }
+            } catch (org.json.JSONException ignored) {}
+        }
+
+        final String finalCurrentA = currentA;
+        final String finalCurrentB = currentB;
+        final org.json.JSONObject finalEntryA = entryA;
+        final org.json.JSONObject finalEntryB = entryB;
+
+        final org.json.JSONArray catalogF = catalog;
+        LinearLayout slotCard = column();
+        slotCard.setBackground(cardBg());
+        slotCard.setPadding(dp(14), dp(12), dp(14), dp(12));
+        slotCard.addView(voiceSlotRow("A", finalEntryA, true, catalogF));
+        LinearLayout divider = new LinearLayout(this);
+        divider.setLayoutParams(new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1)));
+        divider.setBackgroundColor(hairline);
+        LinearLayout.LayoutParams divLp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1));
+        divLp.topMargin = dp(10);
+        divLp.bottomMargin = dp(10);
+        divider.setLayoutParams(divLp);
+        slotCard.addView(divider);
+        slotCard.addView(voiceSlotRow("B", finalEntryB, false, catalogF));
+        screen.addView(slotCard, matchWrap(8));
+
+        screen.addView(text("候補", 13, sub, false, true), matchWrap(16));
+
+        LinearLayout candidatesCard = column();
+        candidatesCard.setBackground(cardBg());
+        candidatesCard.setPadding(dp(14), dp(12), dp(14), dp(12));
+
+        for (int i = 0; i < catalog.length(); i++) {
+            try {
+                final org.json.JSONObject v = catalog.getJSONObject(i);
+                final String key = v.optString("key", "");
+                final String name = v.optString("name", "");
+                final String credit = v.optString("credit", "");
+                final boolean installed = v.optBoolean("installed", false);
+                final boolean consented = v.optBoolean("consented", false);
+                final boolean downloading = voiceDownloading.contains(key);
+
+                LinearLayout row = new LinearLayout(this);
+                row.setOrientation(LinearLayout.HORIZONTAL);
+                row.setGravity(android.view.Gravity.CENTER_VERTICAL);
+                row.setLayoutParams(matchWrap(8));
+
+                LinearLayout leftCol = column();
+                leftCol.addView(text(name, 15, ink, false, true), matchWrap(0));
+                leftCol.addView(text("クレジット表記 \"" + credit + "\"", 12, sub, false, false), matchWrap(0));
+                row.addView(leftCol, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+                TextView rightTv;
+                if (installed) {
+                    rightTv = text("導入済み ✓", 12, sub, false, false);
+                    row.addView(rightTv, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+                } else if (downloading) {
+                    rightTv = text("ダウンロード中…", 12, sub, false, false);
+                    row.addView(rightTv, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+                } else {
+                    rightTv = text("⬇", 18, ink, false, false);
+                    rightTv.setLayoutParams(new LinearLayout.LayoutParams(dp(40), LinearLayout.LayoutParams.WRAP_CONTENT));
+                    rightTv.setGravity(android.view.Gravity.CENTER);
+                    rightTv.setOnClickListener(new android.view.View.OnClickListener() {
+                        @Override public void onClick(android.view.View view) {
+                            if (!consented) {
+                                showVoiceConsent(v);
+                            } else {
+                                startVoiceDownload(v);
+                            }
+                        }
+                    });
+                    row.addView(rightTv);
+                }
+                candidatesCard.addView(row);
+            } catch (org.json.JSONException ignored) {}
+        }
+        screen.addView(candidatesCard, matchWrap(8));
+
+        screen.addView(text("声は VOICEVOX 公式リポジトリから、この端末へ直接ダウンロードされます。ダウンロードの前に、各声の利用規約への同意が必要です。", 11.5f, sub, false, false), matchWrap(8));
+        String creditA = finalEntryA != null ? finalEntryA.optString("credit", "") : "";
+        String creditB = finalEntryB != null ? finalEntryB.optString("credit", "") : "";
+        screen.addView(text("音声合成 VOICEVOX ／ " + creditA + " ・ " + creditB, 11.5f, sub, false, false), matchWrap(8));
+    }
+
+    private void startVoiceDownload(final org.json.JSONObject v) {
+        final String key;
+        try { key = v.getString("key"); } catch (org.json.JSONException e) { return; }
+        voiceDownloading.add(key);
+        showSettings();
+        final String[] res = new String[1];
+        runBg(new Runnable() {
+            @Override public void run() {
+                res[0] = Bridge.downloadVoice(key);
+            }
+        }, new Runnable() {
+            @Override public void run() {
+                voiceDownloading.remove(key);
+                if (res[0] != null && res[0].startsWith("ERR:")) {
+                    toast(res[0]);
+                } else {
+                    toast("ダウンロードしました");
+                }
+                showSettings();
+            }
+        });
+    }
+
+    private void showVoiceConsent(final org.json.JSONObject v) {
+        clearScreen();
+        final String key;
+        final String name;
+        final String credit;
+        final String termsUrl;
+        try {
+            key = v.getString("key");
+            name = v.getString("name");
+            credit = v.getString("credit");
+            termsUrl = v.getString("termsUrl");
+        } catch (org.json.JSONException e) {
+            showSettings();
+            return;
+        }
+
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        header.setLayoutParams(matchWrap(0));
+        TextView back = text("←", ssp(20), ink, false, false);
+        back.setLayoutParams(new LinearLayout.LayoutParams(dp(48), dp(48)));
+        back.setGravity(android.view.Gravity.CENTER);
+        back.setOnClickListener(new android.view.View.OnClickListener() {
+            @Override public void onClick(android.view.View v) { showSettings(); }
+        });
+        header.addView(back);
+        header.addView(text("利用規約", ssp(19), ink, false, true), new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        screen.addView(header, matchWrap(0));
+
+        screen.addView(text(name, 17, ink, true, true), matchWrap(4));
+        screen.addView(text("音声ライブラリ利用規約", 12, sub, false, false), matchWrap(12));
+
+        LinearLayout pointsCard = column();
+        pointsCard.setBackground(cardBg());
+        pointsCard.setPadding(dp(14), dp(12), dp(14), dp(12));
+        pointsCard.addView(text("・商用・非商用を問わず利用できます", 13, sub, false, false), matchWrap(4));
+        pointsCard.addView(text("・音声を使うときは『" + credit + "』のクレジット表記が必要です", 13, sub, false, false), matchWrap(4));
+        pointsCard.addView(text("・禁止：政治・宗教活動、情報商材、虚偽情報の作成、風俗営業、反社会的勢力による利用", 13, sub, false, false), matchWrap(4));
+        pointsCard.addView(text("・声そのもの（音声モデル）の再配布はできません", 13, sub, false, false), matchWrap(4));
+        screen.addView(pointsCard, matchWrap(8));
+
+        TextView termsLink = text("規約全文を読む ›", 13, ink, false, false);
+        termsLink.setLayoutParams(matchWrap(12));
+        termsLink.setOnClickListener(new android.view.View.OnClickListener() {
+            @Override public void onClick(android.view.View v) {
+                try {
+                    android.content.Intent intent = new android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(termsUrl));
+                    startActivity(intent);
+                } catch (Exception ignored) {}
+            }
+        });
+        screen.addView(termsLink);
+
+        screen.addView(text("同意はこの声について記録され、次回からこの画面は表示されません。", 11.5f, sub, false, false), matchWrap(16));
+
+        LinearLayout bottomRow = new LinearLayout(this);
+        bottomRow.setOrientation(LinearLayout.HORIZONTAL);
+        bottomRow.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        bottomRow.setLayoutParams(matchWrap(0));
+        TextView cancel = text("キャンセル", 14, sub, false, false);
+        cancel.setLayoutParams(new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        cancel.setGravity(android.view.Gravity.CENTER);
+        cancel.setOnClickListener(new android.view.View.OnClickListener() {
+            @Override public void onClick(android.view.View v) { showSettings(); }
+        });
+        bottomRow.addView(cancel);
+        Button agreeBtn = pillBtn("同意してダウンロード");
+        agreeBtn.setLayoutParams(new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+        agreeBtn.setOnClickListener(new android.view.View.OnClickListener() {
+            @Override public void onClick(android.view.View v) {
+                final String[] msg = new String[1];
+                runBg(new Runnable() {
+                    @Override public void run() {
+                        String consentRes = Bridge.recordVoiceConsent(key);
+                        if (consentRes != null && consentRes.startsWith("ERR:")) {
+                            msg[0] = consentRes;
+                        } else {
+                            String dlRes = Bridge.downloadVoice(key);
+                            msg[0] = (dlRes != null && dlRes.startsWith("ERR:")) ? dlRes : "ダウンロードしました";
+                        }
+                    }
+                }, new Runnable() {
+                    @Override public void run() {
+                        toast(msg[0]);
+                        showSettings();
+                    }
+                });
+            }
+        });
+        bottomRow.addView(agreeBtn);
+        screen.addView(bottomRow, matchWrap(16));
+    }
+
+    private void pickVoiceForSlot(final boolean slotA, final org.json.JSONArray catalog) {
+        final String[] names = new String[catalog.length()];
+        final String[] keys = new String[catalog.length()];
+        for (int i = 0; i < catalog.length(); i++) {
+            try {
+                org.json.JSONObject v = catalog.getJSONObject(i);
+                names[i] = v.optString("name", "");
+                keys[i] = v.optString("key", "");
+            } catch (org.json.JSONException e) {
+                names[i] = "";
+                keys[i] = "";
+            }
+        }
+
+        new android.app.AlertDialog.Builder(this)
+            .setTitle(slotA ? "ホスト A の声を選択" : "ホスト B の声を選択")
+            .setItems(names, new android.content.DialogInterface.OnClickListener() {
+                @Override public void onClick(android.content.DialogInterface dialog, int which) {
+                    String selectedKey = keys[which];
+                    String newA, newB;
+                    if (slotA) {
+                        newA = selectedKey;
+                        newB = (selectedKey.equals(getCurrentVoiceKey(false))) ? getCurrentVoiceKey(true) : getCurrentVoiceKey(false);
+                    } else {
+                        newB = selectedKey;
+                        newA = (selectedKey.equals(getCurrentVoiceKey(true))) ? getCurrentVoiceKey(false) : getCurrentVoiceKey(true);
+                    }
+                    final String finalNewA = newA;
+                    final String finalNewB = newB;
+                    runBg(new Runnable() {
+                        @Override public void run() {
+                            Bridge.setVoicePair(finalNewA, finalNewB);
+                        }
+                    }, new Runnable() {
+                        @Override public void run() {
+                            showSettings();
+                        }
+                    });
+                }
+            })
+            .show();
+    }
+
+    private String getCurrentVoiceKey(boolean isA) {
+        String json = Bridge.getVoiceCatalog();
+        if (json == null) return "";
+        try {
+            org.json.JSONArray catalog = new org.json.JSONArray(json);
+            for (int i = 0; i < catalog.length(); i++) {
+                org.json.JSONObject v = catalog.getJSONObject(i);
+                if (isA && v.optBoolean("isA", false)) return v.optString("key", "");
+                if (!isA && v.optBoolean("isB", false)) return v.optString("key", "");
+            }
+        } catch (org.json.JSONException ignored) {}
+        return "";
     }
 
 private void seedFixtureIfPresent() {

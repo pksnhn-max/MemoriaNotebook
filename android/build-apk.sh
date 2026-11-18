@@ -57,11 +57,21 @@ cp "$RURI_ASSETS/libonnxruntime-arm64.so" "$W/lib/arm64-v8a/libonnxruntime.so"
 # filesDir on first launch.
 mkdir -p "$W/assets/ruri"
 cp "$RURI_ASSETS/model_int8.onnx" "$RURI_ASSETS/tokenizer.json" "$W/assets/ruri/"
+# Stage 7 (audio overview): the VOICEVOX engine is bundled — the
+# core library (MIT) is linked by the Rust side and the VOICEVOX
+# ONNX Runtime is dlopened at synthesis time. Voice models (VVM)
+# are NOT bundled; the app downloads them per-voice at runtime.
+VV_DIR="$ROOT/android/third_party/voicevox"
+cp "$VV_DIR/libvoicevox_core.so" "$VV_DIR/libvoicevox_onnxruntime.so" "$W/lib/arm64-v8a/"
+# The Open JTalk dictionary (1.11) rides as assets; the vessel
+# extracts it to filesDir before the first synthesis.
+mkdir -p "$W/assets/open_jtalk_dic"
+cp "$ROOT/android/third_party/open_jtalk_dic/"* "$W/assets/open_jtalk_dic/"
 cd "$W"
 cp dex/classes.dex .
 zip -q app-unsigned.apk classes.dex
-zip -q -0 app-unsigned.apk lib/arm64-v8a/libnotebook_app.so lib/arm64-v8a/libonnxruntime.so lib/arm64-v8a/libc++_shared.so
-zip -q -9 app-unsigned.apk assets/ruri/model_int8.onnx assets/ruri/tokenizer.json
+zip -q -0 app-unsigned.apk lib/arm64-v8a/libnotebook_app.so lib/arm64-v8a/libonnxruntime.so lib/arm64-v8a/libc++_shared.so lib/arm64-v8a/libvoicevox_core.so lib/arm64-v8a/libvoicevox_onnxruntime.so
+zip -q -9 app-unsigned.apk assets/ruri/model_int8.onnx assets/ruri/tokenizer.json assets/open_jtalk_dic/*
 "$BT/zipalign" -f 4 app-unsigned.apk app-aligned.apk
 # The debug key must be STABLE across builds, or Android refuses to
 # install a new build over the previous one. It therefore lives
@@ -75,6 +85,6 @@ if [ ! -f "$KEYSTORE" ]; then
     -validity 10000 -dname 'CN=Android Debug,O=Android,C=US'
 fi
 "$BT/apksigner" sign --ks "$KEYSTORE" --ks-pass pass:android \
-  --key-pass pass:android --out "$W/MemoriaNotebook-6d.apk" app-aligned.apk
-"$BT/apksigner" verify "$W/MemoriaNotebook-6d.apk"
-echo "APK: $W/MemoriaNotebook-6d.apk"
+  --key-pass pass:android --out "$W/MemoriaNotebook-7.apk" app-aligned.apk
+"$BT/apksigner" verify "$W/MemoriaNotebook-7.apk"
+echo "APK: $W/MemoriaNotebook-7.apk"

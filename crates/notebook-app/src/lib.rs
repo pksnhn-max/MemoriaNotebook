@@ -1132,3 +1132,367 @@ mod tests {
     }
 }
 
+
+// ---- Stage 7: audio overview (VOICEVOX) ----
+
+use notebook_core::voice::{
+    has_consent, load_summaries, load_voice_pair, record_consent, remove_summary,
+    save_voice_pair, voice_by_key, VOICE_CATALOG,
+};
+
+fn voice_err<T>(e: String) -> Result<T, notebook_core::CoreError> {
+    Err(notebook_core::CoreError::GeneratorError(e))
+}
+
+#[no_mangle]
+pub extern "C" fn Java_jp_memorianotebook_Bridge_getVoiceCatalog(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let result = with_state(|host| {
+        let data_dir = &host.data_dir;
+        let (voice_a, voice_b) = load_voice_pair(data_dir);
+        let catalog: Vec<serde_json::Value> = VOICE_CATALOG
+            .iter()
+            .map(|entry| {
+                let installed = data_dir.join("vvm").join(entry.vvm_file).exists();
+                let consented = has_consent(data_dir, entry.key);
+                serde_json::json!({
+                    "key": entry.key,
+                    "name": entry.name,
+                    "credit": entry.credit,
+                    "termsUrl": entry.terms_url,
+                    "sizeMb": entry.size_mb,
+                    "vvmFile": entry.vvm_file,
+                    "installed": installed,
+                    "consented": consented,
+                    "isA": entry.key == voice_a,
+                    "isB": entry.key == voice_b,
+                })
+            })
+            .collect();
+        Ok(serde_json::to_string(&catalog).unwrap_or_else(|_| "[]".to_string()))
+    });
+    string_result(&mut env, result)
+}
+
+#[no_mangle]
+pub extern "C" fn Java_jp_memorianotebook_Bridge_recordVoiceConsent(
+    mut env: JNIEnv,
+    _class: JClass,
+    key: JString,
+) -> jstring {
+    let key_str = match jstring_to_string(&mut env, &key) {
+        Ok(s) => s,
+        Err(e) => return string_result(&mut env, Err(e)),
+    };
+    let result = with_state(|host| {
+        if voice_by_key(&key_str).is_none() {
+            return voice_err(format!("unknown voice: {key_str}"));
+        }
+        record_consent(&host.data_dir, &key_str)
+            .map_err(notebook_core::CoreError::GeneratorError)?;
+        Ok("OK".to_string())
+    });
+    string_result(&mut env, result)
+}
+
+#[no_mangle]
+pub extern "C" fn Java_jp_memorianotebook_Bridge_downloadVoice(
+    mut env: JNIEnv,
+    _class: JClass,
+    key: JString,
+) -> jstring {
+    let key_str = match jstring_to_string(&mut env, &key) {
+        Ok(s) => s,
+        Err(e) => return string_result(&mut env, Err(e)),
+    };
+    let entry = match voice_by_key(&key_str) {
+        Some(e) => *e,
+        None => {
+            return string_result(&mut env, Err(format!("unknown voice: {key_str}")));
+        }
+    };
+    let data_dir = {
+        let guard = match STATE.lock() {
+            Ok(g) => g,
+            Err(_) => return string_result(&mut env, Err("state poisoned".to_string())),
+        };
+        match guard.as_ref() {
+            Some(host) => host.data_dir.clone(),
+            None => return string_result(&mut env, Err("not initialized".to_string())),
+        }
+    };
+    if !has_consent(&data_dir, entry.key) {
+        return string_result(
+            &mut env,
+            Err("先に利用規約への同意が必要です".to_string()),
+        );
+    }
+    static VOICE_DOWNLOADING: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if VOICE_DOWNLOADING
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return string_result(&mut env, Err("download already in progress".to_string()));
+    }
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            VOICE_DOWNLOADING.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let _guard = Guard;
+    let dir = data_dir.join("vvm");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return string_result(&mut env, Err(e.to_string()));
+    }
+    let dest = dir.join(entry.vvm_file);
+    if dest.exists() {
+        return string_result(&mut env, Ok("OK 0".to_string()));
+    }
+    let result = notebook_net::download_to_file(&entry.vvm_url(), &dest, |_, _| {})
+        .map(|n| format!("OK {n}"))
+        .map_err(|e| e.to_string());
+    string_result(&mut env, result)
+}
+
+#[no_mangle]
+pub extern "C" fn Java_jp_memorianotebook_Bridge_setVoicePair(
+    mut env: JNIEnv,
+    _class: JClass,
+    a: JString,
+    b: JString,
+) -> jstring {
+    let a_str = match jstring_to_string(&mut env, &a) {
+        Ok(s) => s,
+        Err(e) => return string_result(&mut env, Err(e)),
+    };
+    let b_str = match jstring_to_string(&mut env, &b) {
+        Ok(s) => s,
+        Err(e) => return string_result(&mut env, Err(e)),
+    };
+    let result = with_state(|host| {
+        save_voice_pair(&host.data_dir, &a_str, &b_str)
+            .map_err(notebook_core::CoreError::GeneratorError)?;
+        Ok("OK".to_string())
+    });
+    string_result(&mut env, result)
+}
+
+#[no_mangle]
+pub extern "C" fn Java_jp_memorianotebook_Bridge_listVoiceSummaries(
+    mut env: JNIEnv,
+    _class: JClass,
+    nb: jlong,
+) -> jstring {
+    let result = with_state(|host| {
+        let mut summaries = load_summaries(&host.data_dir);
+        summaries.retain(|s| s.nb == nb as u64);
+        summaries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(serde_json::to_string(&summaries).unwrap_or_else(|_| "[]".to_string()))
+    });
+    string_result(&mut env, result)
+}
+
+#[no_mangle]
+pub extern "C" fn Java_jp_memorianotebook_Bridge_deleteVoiceSummary(
+    mut env: JNIEnv,
+    _class: JClass,
+    id: jlong,
+) -> jstring {
+    let result = with_state(|host| {
+        let removed = remove_summary(&host.data_dir, id as u64)
+            .map_err(notebook_core::CoreError::GeneratorError)?;
+        if let Some(summary) = removed {
+            let wav_path = host.data_dir.join("audio").join(&summary.wav_file);
+            let _ = std::fs::remove_file(wav_path);
+        }
+        Ok("OK".to_string())
+    });
+    string_result(&mut env, result)
+}
+
+#[no_mangle]
+pub extern "C" fn Java_jp_memorianotebook_Bridge_generateVoiceSummary(
+    mut env: JNIEnv,
+    _class: JClass,
+    nb: jlong,
+    focus: JString,
+    dict_dir: JString,
+    ort_lib: JString,
+    at: jlong,
+) -> jstring {
+    let focus_str = match jstring_to_string(&mut env, &focus) {
+        Ok(s) => s,
+        Err(e) => return string_result(&mut env, Err(e)),
+    };
+    let dict_dir_str = match jstring_to_string(&mut env, &dict_dir) {
+        Ok(s) => s,
+        Err(e) => return string_result(&mut env, Err(e)),
+    };
+    let ort_lib_str = match jstring_to_string(&mut env, &ort_lib) {
+        Ok(s) => s,
+        Err(e) => return string_result(&mut env, Err(e)),
+    };
+    // Snapshot everything the generation needs under a brief lock;
+    // the script call (network) and the synthesis (on-device, can
+    // take minutes) must not hold the global STATE lock, or every
+    // other JNI call stalls behind them.
+    struct GenSnap {
+        base_url: String,
+        api_key: String,
+        model: String,
+        voice_a_key: String,
+        voice_b_key: String,
+        style_a: u32,
+        style_b: u32,
+        path_a: std::path::PathBuf,
+        path_b: std::path::PathBuf,
+        title: String,
+        source_text: String,
+        data_dir: std::path::PathBuf,
+    }
+    let snap = match with_state(|host| {
+        // (a) The script is written by the API seat only.
+        if host.gen_seat != GenSeat::Api || !host.api_config.is_complete() {
+            return voice_err(
+                "音声概要の台本には API 設定が必要です。設定で API を設定してください"
+                    .to_string(),
+            );
+        }
+        // (b) The pair of voices must both be installed.
+        let (voice_a_key, voice_b_key) = load_voice_pair(&host.data_dir);
+        let voice_a_entry = match voice_by_key(&voice_a_key) {
+            Some(e) => e,
+            None => return voice_err(format!("unknown voice: {voice_a_key}")),
+        };
+        let voice_b_entry = match voice_by_key(&voice_b_key) {
+            Some(e) => e,
+            None => return voice_err(format!("unknown voice: {voice_b_key}")),
+        };
+        let vvm_dir = host.data_dir.join("vvm");
+        let path_a = vvm_dir.join(voice_a_entry.vvm_file);
+        let path_b = vvm_dir.join(voice_b_entry.vvm_file);
+        if !path_a.exists() || !path_b.exists() {
+            return voice_err(
+                "声が未導入です。設定の「対話の声」からダウンロードしてください".to_string(),
+            );
+        }
+        // (c) Notebook title.
+        let title = match host
+            .core
+            .notebooks()
+            .iter()
+            .find(|n| n.id == nb as u64)
+        {
+            Some(n) => n.title.clone(),
+            None => {
+                return Err(notebook_core::CoreError::NotebookNotFound(nb as u64));
+            }
+        };
+        // (d) Source text.
+        let source_text = host.core.notebook_source_text(nb as u64, 12000);
+        if source_text.trim().is_empty() {
+            return voice_err("ソースがありません".to_string());
+        }
+        Ok(GenSnap {
+            base_url: host.api_config.base_url.clone(),
+                        api_key: host.api_config.api_key.clone(),
+            model: host.api_config.model.clone(),
+            style_a: voice_a_entry.style_id,
+            style_b: voice_b_entry.style_id,
+            voice_a_key,
+            voice_b_key,
+            path_a,
+            path_b,
+            title,
+            source_text,
+            data_dir: host.data_dir.clone(),
+        })
+    }) {
+        Ok(snap) => snap,
+        Err(e) => return string_result(&mut env, Err(e)),
+    };
+    let result: Result<String, String> = (|| {
+        use notebook_core::Generator as _;
+        // (e) Script via the API generator.
+        let focus_opt = if focus_str.trim().is_empty() {
+            None
+        } else {
+            Some(focus_str.as_str())
+        };
+        let prompt =
+            notebook_core::voice::build_script_prompt(&snap.title, &snap.source_text, focus_opt);
+        let mut generator = ApiGenerator {
+            base_url: snap.base_url.clone(),
+                        api_key: snap.api_key.clone(),
+            model: snap.model.clone(),
+        };
+        let script_text = generator.generate(&prompt)?;
+        // (f) Parse the dialogue.
+        let lines = notebook_core::voice::parse_script(&script_text)
+            .map_err(notebook_core::CoreError::GeneratorError)?;
+        // (g) Synthesize on-device.
+        let mut synth =
+            notebook_core::voice::VoiceSynth::new(&ort_lib_str, std::path::Path::new(&dict_dir_str))
+                .map_err(notebook_core::CoreError::GeneratorError)?;
+        synth
+            .load_vvm(&snap.path_a)
+            .map_err(notebook_core::CoreError::GeneratorError)?;
+        if snap.path_b != snap.path_a {
+            synth
+                .load_vvm(&snap.path_b)
+                .map_err(notebook_core::CoreError::GeneratorError)?;
+        }
+        let mut wavs = Vec::with_capacity(lines.len());
+        for (speaker, text) in &lines {
+            let style_id = if *speaker == 0 {
+                snap.style_a
+            } else {
+                snap.style_b
+            };
+            let wav = synth
+                .tts(text, style_id)
+                .map_err(notebook_core::CoreError::GeneratorError)?;
+            wavs.push(wav);
+        }
+        let final_wav = notebook_core::voice::concat_wavs(&wavs, 350)
+            .map_err(notebook_core::CoreError::GeneratorError)?;
+        // (h) Save the WAV.
+        let mut id = at as u64;
+        let existing = load_summaries(&snap.data_dir);
+        while existing.iter().any(|s| s.id == id) {
+            id += 1;
+        }
+        let audio_dir = snap.data_dir.join("audio");
+        std::fs::create_dir_all(&audio_dir)
+            .map_err(|e| notebook_core::CoreError::GeneratorError(e.to_string()))?;
+        let wav_file = format!("{id}.wav");
+        std::fs::write(audio_dir.join(&wav_file), &final_wav)
+            .map_err(|e| notebook_core::CoreError::GeneratorError(e.to_string()))?;
+        // (i) Record it.
+        let rec = notebook_core::voice::AudioSummary {
+            id,
+            nb: nb as u64,
+            title: snap.title.clone(),
+            wav_file,
+            voice_a: snap.voice_a_key.clone(),
+            voice_b: snap.voice_b_key.clone(),
+            created_at: at as u64,
+            duration_sec: notebook_core::voice::wav_duration_sec(&final_wav).unwrap_or(0.0),
+        };
+        notebook_core::voice::append_summary(&snap.data_dir, &rec)
+            .map_err(notebook_core::CoreError::GeneratorError)?;
+        serde_json::to_string(&rec)
+            .map_err(|e| notebook_core::CoreError::GeneratorError(e.to_string()))
+    })()
+    .map_err(|e: notebook_core::CoreError| e.to_string());
+    string_result(&mut env, result)
+}

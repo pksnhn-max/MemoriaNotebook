@@ -27,6 +27,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
+pub mod voice;
+
 /// Which seat generates chat replies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -404,6 +406,25 @@ impl CoreState {
     /// a replaced chunk set reads back as `None`.
     pub fn chunk_by_id(&self, chunk_id: u64) -> Option<&ChunkRec> {
         self.chunks.iter().find(|c| c.id == chunk_id)
+    }
+
+    /// The notebook's source text for the audio-overview script: the
+    /// current chunks of every source of the notebook, in source and
+    /// reading order, joined and truncated to `cap` characters.
+    pub fn notebook_source_text(&self, nb: u64, cap: usize) -> String {
+        let mut out = String::new();
+        for src in self.sources.iter().filter(|s| s.nb == nb) {
+            for chunk in self.chunks_of(src.id) {
+                if out.chars().count() >= cap {
+                    return out.chars().take(cap).collect();
+                }
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&chunk.text);
+            }
+        }
+        out.chars().take(cap).collect()
     }
 
     /// The current chunks of one source, in reading order.
