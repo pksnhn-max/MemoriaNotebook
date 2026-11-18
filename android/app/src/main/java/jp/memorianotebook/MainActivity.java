@@ -992,7 +992,14 @@ public final class MainActivity extends Activity {
                 thread.addView(row, matchWrap(12));
             } else {
                 // Citation markers [#id] render as small [id] chips.
-                String shown = bodyText.replaceAll("\\[#(\\d+)\\]", "[$1]");
+                // The vessel has no Markdown renderer: the model's
+                // emphasis markers would show literally, so they are
+                // stripped here (display-only; the stored text and the
+                // citation parsing upstream stay untouched).
+                String shown = bodyText.replaceAll("\\[#(\\d+)\\]", "[$1]")
+                        .replace("**", "")
+                        .replace("__", "")
+                        .replaceAll("(?m)^#{1,6} +", "");
                 TextView a = text(shown, 15, ink, false, false);
                 thread.addView(a, matchWrap(12));
                 if (!cites.isEmpty()) {
