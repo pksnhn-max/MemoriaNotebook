@@ -537,6 +537,7 @@ private void showSettings() {
 
         // Load current config
         final String[] cfg = { Bridge.getApiConfig() };
+        final String[] currentSeat = { getSeatFromCfg(cfg[0]) };
 
         screen.addView(text("生成の座", 13, sub, false, true), matchWrap(16));
         LinearLayout seat = column();
@@ -549,9 +550,27 @@ private void showSettings() {
         seat.addView(text("端末内のモデルで生成します。",
                 12, sub, false, false));
         seat.addView(apiLabel, matchWrap(10));
-        seat.addView(text("自分のエンドポイントとキーを差す席です。接続は次の更新で入ります。",
+        seat.addView(text("自分のエンドポイントとキーを差す席です。",
                 12, sub, false, false));
         screen.addView(seat, matchWrap(8));
+
+        // Make seat labels clickable
+        localLabel.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                currentSeat[0] = "local";
+                localLabel.setText("● ローカル（既定）");
+                apiLabel.setText("○ API（任意）");
+            }
+        });
+        apiLabel.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                currentSeat[0] = "api";
+                localLabel.setText("○ ローカル（既定）");
+                apiLabel.setText("● API（任意）");
+            }
+        });
 
         // API config fields
         final EditText baseUrl = new EditText(this);
@@ -652,8 +671,7 @@ private void showSettings() {
         saveBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                boolean isApi = "api".equals(getSeatFromCfg(cfg[0]));
-                final String seat = isApi ? "api" : "local";
+                final String seat = currentSeat[0];
                 final String url = baseUrl.getText().toString().trim();
                 final String key = apiKey.getText().toString().trim();
                 final String model = modelName.getText().toString().trim();
@@ -669,7 +687,14 @@ private void showSettings() {
                     public void run() {
                         saveBtn.setEnabled(true);
                         status.setText(cfg[0] != null ? cfg[0] : "保存完了");
-                        refreshSeatLabels(cfg[0]);
+                        // Update seat labels to reflect saved seat
+                        if ("api".equals(currentSeat[0])) {
+                            localLabel.setText("○ ローカル（既定）");
+                            apiLabel.setText("● API（任意）");
+                        } else {
+                            localLabel.setText("● ローカル（既定）");
+                            apiLabel.setText("○ API（任意）");
+                        }
                     }
                 });
             }
@@ -898,10 +923,7 @@ private void showSettings() {
         } catch (Throwable ignored) {}
     }
 
-    private void refreshSeatLabels(String cfgJson) {
-        // This is a no-op here because showSettings() rebuilds the whole screen.
-        // Kept for symmetry; actual refresh happens on next showSettings().
-    }
+
 
     /** Bottom bar of the list screen (nb1 v3): a floating
      *  "＋ 新規作成" pill; tapped, it opens the title field in place. */
@@ -1577,21 +1599,35 @@ private void seedFixtureIfPresent() {
                     if (!modelsDir.exists()) modelsDir.mkdirs();
                     java.io.File ggufOut = new java.io.File(modelsDir, "tinyswallow-1.5b-instruct-q5_k_m.gguf");
                     if (!ggufOut.exists()) {
+                        // Copy atomically: write to a .part sibling and
+                        // rename only on success, so a failed copy never
+                        // leaves an incomplete file that exists() would
+                        // mistake for a completed one on the next launch.
+                        java.io.File ggufPart = new java.io.File(modelsDir, "tinyswallow-1.5b-instruct-q5_k_m.gguf.part");
                         java.io.InputStream in = null;
                         java.io.FileOutputStream fos = null;
+                        boolean copied = false;
                         try {
                             in = getAssets().open("fixture/tinyswallow-1.5b-instruct-q5_k_m.gguf");
-                            fos = new java.io.FileOutputStream(ggufOut);
+                            fos = new java.io.FileOutputStream(ggufPart);
                             byte[] buf = new byte[65536];
                             int r;
                             while ((r = in.read(buf)) > 0) {
                                 fos.write(buf, 0, r);
                             }
+                            copied = true;
                         } catch (java.io.IOException e) {
-                            // ignore, leave file possibly incomplete
+                            // copy failed: the .part file is removed below
                         } finally {
                             if (in != null) try { in.close(); } catch (java.io.IOException ignored) {}
                             if (fos != null) try { fos.close(); } catch (java.io.IOException ignored) {}
+                        }
+                        if (copied) {
+                            if (!ggufPart.renameTo(ggufOut)) {
+                                ggufPart.delete();
+                            }
+                        } else {
+                            ggufPart.delete();
                         }
                     }
 
@@ -1621,27 +1657,30 @@ private void seedFixtureIfPresent() {
                         }
                         epubBytes = baos.toByteArray();
                     } catch (java.io.IOException e) {
-                        try { epubIn.close(); } catch (java.io.IOException ignored) {}
                         return;
                     } finally {
                         try { epubIn.close(); } catch (java.io.IOException ignored) {}
+                    }
+
+                    // Write the marker BEFORE creating anything
+                    // (at-most-once): if the process dies after this
+                    // point, the next launch will not create a second
+                    // notebook. If the marker cannot be written, do
+                    // not create the notebook at all.
+                    java.io.FileOutputStream markerFos = null;
+                    try {
+                        markerFos = new java.io.FileOutputStream(marker);
+                        markerFos.write(new byte[0]);
+                    } catch (java.io.IOException e) {
+                        return;
+                    } finally {
+                        if (markerFos != null) try { markerFos.close(); } catch (java.io.IOException ignored) {}
                     }
 
                     // Create notebook and add file source via Bridge
                     long nbId = Bridge.createNotebook("国家と革命（テスト）", System.currentTimeMillis() / 1000);
                     if (nbId > 0) {
                         Bridge.addFileSource(nbId, "国家と革命 第1章", "epub", epubBytes);
-                    }
-
-                    // Write marker file (empty) to indicate seeding done
-                    java.io.FileOutputStream markerFos = null;
-                    try {
-                        markerFos = new java.io.FileOutputStream(marker);
-                        markerFos.write(new byte[0]);
-                    } catch (java.io.IOException e) {
-                        // marker not created; next launch will retry
-                    } finally {
-                        if (markerFos != null) try { markerFos.close(); } catch (java.io.IOException ignored) {}
                     }
                 } catch (Throwable t) {
                     // never crash
