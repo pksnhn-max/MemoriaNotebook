@@ -1,4 +1,8 @@
 package jp.memorianotebook;
+import android.widget.AutoCompleteTextView;
+import android.widget.ArrayAdapter;
+import org.json.JSONArray;
+import org.json.JSONObject;
 
 import android.app.Activity;
 import android.content.res.Configuration;
@@ -508,7 +512,7 @@ public final class MainActivity extends Activity {
     /** nb6 settings frame with today's real state: the generation
      *  seat and the local model are shown as they are; the API
      *  fields get wired when the API seat lands. */
-    private void showSettings() {
+private void showSettings() {
         searching = false;
         clearScreen();
         LinearLayout head = new LinearLayout(this);
@@ -530,17 +534,151 @@ public final class MainActivity extends Activity {
         head.addView(t);
         screen.addView(head);
 
+        // Load current config
+        final String[] cfg = { Bridge.getApiConfig() };
+
         screen.addView(text("生成の座", 13, sub, false, true), matchWrap(16));
         LinearLayout seat = column();
         seat.setBackground(cardBg());
         seat.setPadding(sdp(14), sdp(12), sdp(14), sdp(12));
-        seat.addView(text("● ローカル（既定）", 15, ink, false, true));
+
+        final TextView localLabel = text("● ローカル（既定）", 15, ink, false, true);
+        final TextView apiLabel = text("○ API（任意）", 15, ink, false, false);
+        seat.addView(localLabel);
         seat.addView(text("端末内のモデルで生成します。",
                 12, sub, false, false));
-        seat.addView(text("○ API（任意）", 15, ink, false, false), matchWrap(10));
+        seat.addView(apiLabel, matchWrap(10));
         seat.addView(text("自分のエンドポイントとキーを差す席です。接続は次の更新で入ります。",
                 12, sub, false, false));
         screen.addView(seat, matchWrap(8));
+
+        // API config fields
+        final EditText baseUrl = new EditText(this);
+        baseUrl.setHint("ベース URL (例: https://api.openai.com/v1)");
+        baseUrl.setTextColor(ink);
+        baseUrl.setHintTextColor(sub);
+        baseUrl.setBackgroundColor(Color.TRANSPARENT);
+        baseUrl.setSingleLine(true);
+
+        final EditText apiKey = new EditText(this);
+        apiKey.setHint("API キー");
+        apiKey.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        apiKey.setTextColor(ink);
+        apiKey.setHintTextColor(sub);
+        apiKey.setBackgroundColor(Color.TRANSPARENT);
+        apiKey.setSingleLine(true);
+
+        final AutoCompleteTextView modelName = new AutoCompleteTextView(this);
+        modelName.setHint("モデル名 (例: gpt-4o-mini)");
+        modelName.setTextColor(ink);
+        modelName.setHintTextColor(sub);
+        modelName.setBackgroundColor(Color.TRANSPARENT);
+        modelName.setSingleLine(true);
+        modelName.setThreshold(0);
+
+        final TextView status = text("", 12, sub, false, false);
+
+        LinearLayout apiCard = column();
+        apiCard.setBackground(cardBg());
+        apiCard.setPadding(sdp(14), sdp(12), sdp(14), sdp(12));
+        apiCard.addView(text("API 設定", 13, sub, false, true));
+        apiCard.addView(text("ベース URL", 12, sub, false, false), matchWrap(4));
+        apiCard.addView(baseUrl, matchWrap(4));
+        apiCard.addView(text("API キー", 12, sub, false, false), matchWrap(4));
+        apiCard.addView(apiKey, matchWrap(4));
+        apiCard.addView(text("モデル名", 12, sub, false, false), matchWrap(4));
+        apiCard.addView(modelName, matchWrap(4));
+
+        LinearLayout btnRow = new LinearLayout(this);
+        btnRow.setOrientation(LinearLayout.HORIZONTAL);
+        btnRow.setGravity(Gravity.CENTER_VERTICAL);
+        Button fetchBtn = pillBtn("モデル一覧を取得");
+        fetchBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                final String url = baseUrl.getText().toString().trim();
+                final String key = apiKey.getText().toString().trim();
+                if (url.isEmpty() || key.isEmpty()) {
+                    status.setText("URL とキーを入力してください");
+                    return;
+                }
+                fetchBtn.setEnabled(false);
+                status.setText("取得中…");
+                runBg(new Runnable() {
+                    @Override
+                    public void run() {
+                        cfg[0] = Bridge.fetchApiModels(url, key);
+                    }
+                }, new Runnable() {
+                    @Override
+                    public void run() {
+                        fetchBtn.setEnabled(true);
+                        String res = cfg[0];
+                        if (res != null && res.startsWith("[")) {
+                            try {
+                                org.json.JSONArray arr = new org.json.JSONArray(res);
+                                List<String> models = new ArrayList<>();
+                                for (int i = 0; i < arr.length(); i++) {
+                                    models.add(arr.getString(i));
+                                }
+                                ArrayAdapter<String> adapter = new ArrayAdapter<>(
+                                        MainActivity.this,
+                                        android.R.layout.simple_dropdown_item_1line,
+                                        models);
+                                modelName.setAdapter(adapter);
+                                status.setText(models.size() + " 件のモデルを取得");
+                            } catch (Throwable th) {
+                                status.setText("パース失敗: " + th.getMessage());
+                            }
+                        } else if (res != null && res.startsWith("{\"error\":")) {
+                            try {
+                                org.json.JSONObject obj = new org.json.JSONObject(res);
+                                status.setText(obj.getString("error"));
+                            } catch (Throwable th) {
+                                status.setText("エラー応答");
+                            }
+                        } else {
+                            status.setText(res != null ? res : "不明な応答");
+                        }
+                    }
+                });
+            }
+        });
+        btnRow.addView(fetchBtn);
+        apiCard.addView(btnRow, matchWrap(8));
+
+        Button saveBtn = pillBtn("保存");
+        saveBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                boolean isApi = "api".equals(getSeatFromCfg(cfg[0]));
+                final String seat = isApi ? "api" : "local";
+                final String url = baseUrl.getText().toString().trim();
+                final String key = apiKey.getText().toString().trim();
+                final String model = modelName.getText().toString().trim();
+                saveBtn.setEnabled(false);
+                status.setText("保存中…");
+                runBg(new Runnable() {
+                    @Override
+                    public void run() {
+                        cfg[0] = Bridge.setApiConfig(seat, url, key, model);
+                    }
+                }, new Runnable() {
+                    @Override
+                    public void run() {
+                        saveBtn.setEnabled(true);
+                        status.setText(cfg[0] != null ? cfg[0] : "保存完了");
+                        refreshSeatLabels(cfg[0]);
+                    }
+                });
+            }
+        });
+        apiCard.addView(saveBtn, matchWrap(8));
+        apiCard.addView(status, matchWrap(4));
+        screen.addView(apiCard, matchWrap(8));
+
+        // Prefill from config
+        prefillFromCfg(cfg[0], baseUrl, apiKey, modelName, localLabel, apiLabel);
 
         screen.addView(text("ローカルモデル", 13, sub, false, true), matchWrap(16));
         LinearLayout model = column();
@@ -728,6 +866,40 @@ public final class MainActivity extends Activity {
                 + "API 未設定のとき、生成は設定への案内を出して止まります。",
                 12, sub, false, false));
         screen.addView(audio, matchWrap(8));
+    }
+
+    private String getSeatFromCfg(String cfgJson) {
+        if (cfgJson == null) return "local";
+        try {
+            org.json.JSONObject obj = new org.json.JSONObject(cfgJson);
+            return obj.optString("seat", "local");
+        } catch (Throwable th) {
+            return "local";
+        }
+    }
+
+    private void prefillFromCfg(String cfgJson, EditText baseUrl, EditText apiKey,
+                                AutoCompleteTextView modelName, TextView localLabel, TextView apiLabel) {
+        if (cfgJson == null) return;
+        try {
+            org.json.JSONObject obj = new org.json.JSONObject(cfgJson);
+            String seat = obj.optString("seat", "local");
+            baseUrl.setText(obj.optString("base_url", ""));
+            apiKey.setText(obj.optString("api_key", ""));
+            modelName.setText(obj.optString("model", ""));
+            if ("api".equals(seat)) {
+                localLabel.setText("○ ローカル（既定）");
+                apiLabel.setText("● API（任意）");
+            } else {
+                localLabel.setText("● ローカル（既定）");
+                apiLabel.setText("○ API（任意）");
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private void refreshSeatLabels(String cfgJson) {
+        // This is a no-op here because showSettings() rebuilds the whole screen.
+        // Kept for symmetry; actual refresh happens on next showSettings().
     }
 
     /** Bottom bar of the list screen (nb1 v3): a floating

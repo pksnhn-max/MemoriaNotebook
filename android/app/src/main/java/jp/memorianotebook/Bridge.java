@@ -36,4 +36,10 @@ public final class Bridge {
     public static native String listSources(long notebookId);
     /** One line per turn: role \t text \t cited chunk ids (comma-separated). */
     public static native String listTurns(long notebookId);
+    /** Persist API settings and return short status. */
+    public static native String setApiConfig(String seat, String baseUrl, String apiKey, String model);
+    /** Return current API settings as JSON. */
+    public static native String getApiConfig();
+    /** Fetch available models from API endpoint; JSON array of ids or {"error":"..."}. */
+    public static native String fetchApiModels(String baseUrl, String apiKey);
 }
