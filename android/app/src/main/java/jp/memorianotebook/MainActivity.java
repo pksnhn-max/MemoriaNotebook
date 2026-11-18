@@ -273,11 +273,19 @@ public final class MainActivity extends Activity {
             String[] names = {"model_int8.onnx", "tokenizer.json"};
             for (String name : names) {
                 java.io.File out = new java.io.File(dir, name);
-                android.content.res.AssetFileDescriptor afd =
-                        getAssets().openFd("ruri/" + name);
-                long assetLen = afd.getLength();
-                afd.close();
-                if (out.exists() && out.length() == assetLen) continue;
+                // openFd throws on compressed assets (the ruri files
+                // are deflated in the APK). That must not abort the
+                // extraction: fall back to "length unknown, copy".
+                long assetLen = -1;
+                try {
+                    android.content.res.AssetFileDescriptor afd =
+                            getAssets().openFd("ruri/" + name);
+                    assetLen = afd.getLength();
+                    afd.close();
+                } catch (Throwable ignored) {
+                    // Compressed asset: copy unconditionally below.
+                }
+                if (assetLen >= 0 && out.exists() && out.length() == assetLen) continue;
                 java.io.InputStream in = getAssets().open("ruri/" + name);
                 java.io.FileOutputStream fos = new java.io.FileOutputStream(out);
                 byte[] buf = new byte[65536];
