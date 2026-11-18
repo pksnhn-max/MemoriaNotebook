@@ -67,6 +67,12 @@ cp "$VV_DIR/libvoicevox_core.so" "$VV_DIR/libvoicevox_onnxruntime.so" "$W/lib/ar
 # extracts it to filesDir before the first synthesis.
 mkdir -p "$W/assets/open_jtalk_dic"
 cp "$ROOT/android/third_party/open_jtalk_dic/"* "$W/assets/open_jtalk_dic/"
+# sys.dic is vendored gzipped (the raw file exceeds what the push
+# route accepts); expand it into the staging assets when needed.
+if [ ! -f "$W/assets/open_jtalk_dic/sys.dic" ] && [ -f "$W/assets/open_jtalk_dic/sys.dic.gz" ]; then
+  gunzip -c "$W/assets/open_jtalk_dic/sys.dic.gz" > "$W/assets/open_jtalk_dic/sys.dic"
+fi
+rm -f "$W/assets/open_jtalk_dic/sys.dic.gz"
 cd "$W"
 cp dex/classes.dex .
 zip -q app-unsigned.apk classes.dex
