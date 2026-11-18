@@ -399,6 +399,13 @@ impl CoreState {
         Ok(made)
     }
 
+    /// One current chunk by its id, if it still exists. Only the
+    /// newest revision per source is kept in memory, so an id from
+    /// a replaced chunk set reads back as `None`.
+    pub fn chunk_by_id(&self, chunk_id: u64) -> Option<&ChunkRec> {
+        self.chunks.iter().find(|c| c.id == chunk_id)
+    }
+
     /// The current chunks of one source, in reading order.
     pub fn chunks_of(&self, source_id: u64) -> Vec<&ChunkRec> {
         let mut v: Vec<&ChunkRec> = self
@@ -987,6 +994,24 @@ mod tests {
         assert!(got.iter().all(|c| c.rev == 2));
         assert_eq!(got[0].ord, 0);
         assert_eq!(got[1].ord, 1);
+    }
+
+    #[test]
+    fn chunk_by_id_hits_current_and_misses_replaced() {
+        let dir = temp_dir();
+        let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+        let nb = st.create_notebook("A", 1).unwrap();
+        let src = st
+            .add_source(nb.id, SourceKind::Text, "s", "/data/s.txt", 2)
+            .unwrap();
+        let made = st.set_source_text(src.id, "根拠の文。").unwrap();
+        let hit = st.chunk_by_id(made[0].id).unwrap();
+        assert_eq!(hit.text, "根拠の文。");
+        assert_eq!(hit.source_id, src.id);
+        assert!(st.chunk_by_id(999_999).is_none());
+        // Re-chunking replaces the set: the old id must stop resolving.
+        st.set_source_text(src.id, "新しい文。").unwrap();
+        assert!(st.chunk_by_id(made[0].id).is_none());
     }
 
     #[test]

@@ -6,10 +6,19 @@ import org.json.JSONObject;
 
 import android.app.Activity;
 import android.content.res.Configuration;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
+import android.text.SpannableStringBuilder;
+import android.text.Spanned;
+import android.text.TextPaint;
+import android.text.method.LinkMovementMethod;
+import android.text.style.ClickableSpan;
+import android.text.style.ReplacementSpan;
 import android.view.Gravity;
 import android.view.View;
 import android.view.WindowInsets;
@@ -24,6 +33,8 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Stage 6b vessel: one Activity, no judgement. It renders the
@@ -1143,6 +1154,159 @@ private void showSettings() {
         return bar;
     }
 
+    // ---------- citations ----------
+
+    /** Small rounded citation chip drawn in place of a [#id]
+     *  marker, in the mock's form: a short box carrying the
+     *  citation's sequential number. The click itself is a
+     *  ClickableSpan laid over the same range. */
+    private final class CiteChipSpan extends ReplacementSpan {
+        private final String label;
+
+        CiteChipSpan(String label) {
+            this.label = label;
+        }
+
+        private TextPaint chipPaint(Paint src) {
+            TextPaint p = new TextPaint(src);
+            p.setTextSize(getResources().getDisplayMetrics().scaledDensity * 10.5f);
+            p.setTypeface(Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD));
+            p.setColor(sub);
+            return p;
+        }
+
+        private int chipWidth(Paint src) {
+            return Math.max(dp(18),
+                    (int) Math.ceil(chipPaint(src).measureText(label)) + dp(8));
+        }
+
+        @Override
+        public int getSize(Paint paint, CharSequence text, int start,
+                           int end, Paint.FontMetricsInt fm) {
+            if (fm != null) {
+                fm.ascent = Math.min(fm.ascent, -dp(15));
+                fm.descent = Math.max(fm.descent, dp(3));
+                fm.top = Math.min(fm.top, -dp(15));
+                fm.bottom = Math.max(fm.bottom, dp(3));
+            }
+            return chipWidth(paint) + dp(2);
+        }
+
+        @Override
+        public void draw(Canvas canvas, CharSequence text, int start,
+                         int end, float x, int top, int y, int bottom,
+                         Paint paint) {
+            int w = chipWidth(paint);
+            RectF rect = new RectF(x + dp(1), y - dp(15),
+                    x + dp(1) + w, y + dp(3));
+            Paint bg = new Paint(Paint.ANTI_ALIAS_FLAG);
+            bg.setColor(hairline);
+            bg.setStyle(Paint.Style.FILL);
+            canvas.drawRoundRect(rect, dp(5), dp(5), bg);
+            TextPaint p = chipPaint(paint);
+            p.setTextAlign(Paint.Align.CENTER);
+            Paint.FontMetricsInt fm = p.getFontMetricsInt();
+            float baseline = rect.centerY() - (fm.ascent + fm.descent) / 2f;
+            canvas.drawText(label, rect.centerX(), baseline, p);
+        }
+    }
+
+    /** Answer text with valid [#id] markers turned into tappable
+     *  chips (sequential numbers, as in the mock). A marker whose id
+     *  is not among the turn's verified citations stays plain [id]
+     *  text, as before. Display-only: the stored text and the
+     *  citation parsing upstream stay untouched. */
+    private SpannableStringBuilder citationText(String bodyText,
+                                                  final List<Long> citeIds) {
+        String cleaned = bodyText.replace("**", "")
+                .replace("__", "")
+                .replaceAll("(?m)^#{1,6} +", "");
+        SpannableStringBuilder b = new SpannableStringBuilder();
+        Matcher m = Pattern.compile("\\[#(\\d+)\\]").matcher(cleaned);
+        int pos = 0;
+        while (m.find()) {
+            b.append(cleaned, pos, m.start());
+            long id = -1;
+            try {
+                id = Long.parseLong(m.group(1));
+            } catch (NumberFormatException e) {
+                id = -1;
+            }
+            int idx = citeIds.indexOf(id);
+            if (idx >= 0) {
+                final long chunkId = id;
+                String label = String.valueOf(idx + 1);
+                int start = b.length();
+                b.append(label);
+                b.setSpan(new CiteChipSpan(label), start, b.length(),
+                        Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                b.setSpan(new ClickableSpan() {
+                    @Override
+                    public void onClick(View w) {
+                        showChunk(chunkId);
+                    }
+
+                    @Override
+                    public void updateDrawState(TextPaint ds) {
+                        // The chip span draws the range itself.
+                    }
+                }, start, b.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            } else {
+                b.append("[").append(m.group(1)).append("]");
+            }
+            pos = m.end();
+        }
+        b.append(cleaned, pos, cleaned.length());
+        return b;
+    }
+
+    /** Open one cited chunk: the source title as the heading, the
+     *  chunk's own text as the body. A chunk id that no longer
+     *  resolves (the source was re-chunked since) says so plainly. */
+    private void showChunk(long chunkId) {
+        String[][] rows = lines(Bridge.getChunk(chunkId));
+        if (rows.length == 0 || rows[0].length < 2) {
+            toast("出典の断片が見つかりませんでした");
+            return;
+        }
+        String title = unesc(rows[0][0]);
+        new android.app.AlertDialog.Builder(this)
+                .setTitle(title.isEmpty() ? "出典" : title)
+                .setMessage(unesc(rows[0][1]))
+                .setPositiveButton("閉じる", null)
+                .show();
+    }
+
+    /** Fallback chip row for a turn whose verified citations carry
+     *  no inline marker (older records): one tappable chip per
+     *  citation, numbered as the inline chips are. */
+    private LinearLayout citationRow(final List<Long> citeIds) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        for (int i = 0; i < citeIds.size(); i++) {
+            final long chunkId = citeIds.get(i);
+            TextView chip = text(String.valueOf(i + 1), 12, sub, false, true);
+            GradientDrawable bg = new GradientDrawable();
+            bg.setColor(hairline);
+            bg.setCornerRadius(dp(5));
+            chip.setBackground(bg);
+            chip.setPadding(dp(8), dp(2), dp(8), dp(2));
+            chip.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    showChunk(chunkId);
+                }
+            });
+            LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT);
+            if (i > 0) cp.leftMargin = dp(6);
+            chip.setLayoutParams(cp);
+            row.addView(chip);
+        }
+        return row;
+    }
+
     // ---------- nb2: chat ----------
 
     private void buildChat(LinearLayout body) {
@@ -1194,21 +1358,35 @@ private void showSettings() {
                 row.addView(bubble);
                 thread.addView(row, matchWrap(12));
             } else {
-                // Citation markers [#id] render as small [id] chips.
+                // Citation markers [#id] render as small tappable
+                // chips that open the cited chunk (see citationText).
                 // The vessel has no Markdown renderer: the model's
                 // emphasis markers would show literally, so they are
-                // stripped here (display-only; the stored text and the
-                // citation parsing upstream stay untouched).
-                String shown = bodyText.replaceAll("\\[#(\\d+)\\]", "[$1]")
-                        .replace("**", "")
-                        .replace("__", "")
-                        .replaceAll("(?m)^#{1,6} +", "");
-                TextView a = text(shown, 15, ink, false, false);
-                thread.addView(a, matchWrap(12));
+                // stripped there (display-only; the stored text and
+                // the citation parsing upstream stay untouched).
+                List<Long> citeIds = new ArrayList<>();
                 if (!cites.isEmpty()) {
-                    TextView c = text("出典 " + cites.split(",").length + " 件",
-                            12, sub, false, false);
-                    thread.addView(c, matchWrap(4));
+                    for (String part : cites.split(",")) {
+                        try {
+                            citeIds.add(Long.parseLong(part.trim()));
+                        } catch (NumberFormatException e) {
+                            // A malformed id simply gets no chip.
+                        }
+                    }
+                }
+                SpannableStringBuilder shown = citationText(bodyText, citeIds);
+                TextView a = text("", 15, ink, false, false);
+                a.setText(shown);
+                if (shown.getSpans(0, shown.length(), CiteChipSpan.class).length > 0) {
+                    a.setMovementMethod(LinkMovementMethod.getInstance());
+                    a.setHighlightColor(Color.TRANSPARENT);
+                }
+                thread.addView(a, matchWrap(12));
+                if (!citeIds.isEmpty()
+                        && shown.getSpans(0, shown.length(), CiteChipSpan.class).length == 0) {
+                    // No inline marker for these citations (older
+                    // records): the chips go under the answer instead.
+                    thread.addView(citationRow(citeIds), matchWrap(4));
                 }
             }
         }

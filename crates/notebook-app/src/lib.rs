@@ -321,6 +321,24 @@ fn fmt_turns(st: &CoreState, nb: u64) -> CoreResult<String> {
         .join("\n"))
 }
 
+/// One chunk for the citation viewer: `source title \t chunk text`,
+/// both escaped. Empty when the chunk id no longer resolves (the
+/// source was re-chunked after the turn was recorded).
+fn fmt_chunk(st: &CoreState, chunk_id: u64) -> String {
+    match st.chunk_by_id(chunk_id) {
+        Some(c) => {
+            let title = st
+                .sources_of(c.nb)
+                .into_iter()
+                .find(|s| s.id == c.source_id)
+                .map(|s| s.title.clone())
+                .unwrap_or_default();
+            format!("{}\t{}", esc(&title), esc(&c.text))
+        }
+        None => String::new(),
+    }
+}
+
 fn with_state<T>(f: impl FnOnce(&mut Host) -> CoreResult<T>) -> Result<T, String> {
     let mut guard = STATE.lock().map_err(|_| "state poisoned".to_string())?;
     let host = guard.as_mut().ok_or("not initialized")?;
@@ -924,6 +942,19 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_listTurns(
     string_result(&mut env, result)
 }
 
+/// Fetch one cited chunk for the viewer: `source title \t chunk
+/// text` (escaped), or an empty string when the id no longer
+/// resolves.
+#[no_mangle]
+pub extern "C" fn Java_jp_memorianotebook_Bridge_getChunk(
+    mut env: JNIEnv,
+    _class: JClass,
+    chunk_id: jlong,
+) -> jstring {
+    let result = with_state(|h| Ok(fmt_chunk(&h.core, chunk_id as u64)));
+    string_result(&mut env, result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1087,6 +1118,15 @@ mod tests {
         // The canned answer cites a chunk, so the citation field is non-empty.
         let cites = lines[1].rsplit('\t').next().unwrap();
         assert!(!cites.is_empty(), "expected a cited chunk id: {lines:?}");
+
+        // The cited chunk resolves for the viewer, with its source
+        // title, and an unknown id resolves to empty.
+        let chunk_id: u64 = cites.split(',').next().unwrap().parse().unwrap();
+        let chunk = fmt_chunk(&st, chunk_id);
+        let mut fields = chunk.split('\t');
+        assert_eq!(fields.next().unwrap(), "天満川メモ");
+        assert!(fields.next().unwrap().contains("南観音は天満川の西岸"));
+        assert_eq!(fmt_chunk(&st, 999_999), "");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

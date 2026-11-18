@@ -36,6 +36,8 @@ public final class Bridge {
     public static native String listSources(long notebookId);
     /** One line per turn: role \t text \t cited chunk ids (comma-separated). */
     public static native String listTurns(long notebookId);
+    /** One cited chunk: source title, tab, chunk text (escaped), or empty. */
+    public static native String getChunk(long chunkId);
     /** Persist API settings and return short status. */
     public static native String setApiConfig(String seat, String baseUrl, String apiKey, String model);
     /** Return current API settings as JSON. */
