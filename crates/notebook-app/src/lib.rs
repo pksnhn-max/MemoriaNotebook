@@ -21,9 +21,13 @@ use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jlong, jstring};
 use jni::JNIEnv;
 use notebook_core::{ChatTurn, CoreResult, CoreState, Embedder, EngineCfg, SourceKind};
-#[cfg(test)]
 use notebook_core::Generator;
 use std::sync::Mutex;
+use notebook_core::CoreError;
+use std::fs;
+use std::io::Write;
+use serde::{Deserialize, Serialize};
+use notebook_net::{get_with_headers, post_json};
 
 /// Everything the bridge owns: the core plus the embedder seat.
 /// The embedder is chosen once at init (ruri when its files are
@@ -40,7 +44,43 @@ struct Host {
     /// something to load on every cold start before it is needed).
     gen: Option<notebook_infer::LlamaGenerator>,
     gen_name: String,
+    /// Persisted API configuration and seat selection.
+    api_config: ApiConfig,
+    /// Current generator seat: "local" or "api".
+    gen_seat: GenSeat,
 }
+
+/// Generator seat selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum GenSeat {
+    Local,
+    Api,
+}
+
+impl Default for GenSeat {
+    fn default() -> Self {
+        GenSeat::Local
+    }
+}
+
+/// API generator configuration, persisted as settings.json.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ApiConfig {
+    base_url: String,
+    api_key: String,
+    model: String,
+}
+
+impl ApiConfig {
+    fn is_complete(&self) -> bool {
+        !self.base_url.is_empty() && !self.api_key.is_empty() && !self.model.is_empty()
+    }
+}
+
+/// Settings file name.
+const SETTINGS_FILE: &str = "settings.json";
+
 
 /// The GGUF currently designated as the local model: the first
 /// `.gguf` file (sorted) in `data_dir/models`, if any.
@@ -71,6 +111,104 @@ fn gen_name_for(data_dir: &std::path::Path) -> String {
 }
 
 static STATE: Mutex<Option<Host>> = Mutex::new(None);
+
+/// Load settings from data_dir/settings.json. Returns defaults on any error.
+fn load_settings(data_dir: &std::path::Path) -> (GenSeat, ApiConfig) {
+    let path = data_dir.join(SETTINGS_FILE);
+    match fs::read_to_string(&path) {
+        Ok(content) => {
+            match serde_json::from_str::<Settings>(&content) {
+                Ok(s) => (s.gen_seat, s.api_config),
+                Err(_) => (GenSeat::default(), ApiConfig::default()),
+            }
+        }
+        Err(_) => (GenSeat::default(), ApiConfig::default()),
+    }
+}
+
+/// Persisted settings structure.
+#[derive(Serialize, Deserialize)]
+struct Settings {
+    gen_seat: GenSeat,
+    api_config: ApiConfig,
+}
+
+/// Save settings atomically (write temp + rename).
+fn save_settings(data_dir: &std::path::Path, seat: GenSeat, config: &ApiConfig) -> Result<(), String> {
+    let settings = Settings {
+        gen_seat: seat,
+        api_config: config.clone(),
+    };
+    let content = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
+    let path = data_dir.join(SETTINGS_FILE);
+    let tmp_path = path.with_extension("json.tmp");
+    {
+        let mut f = fs::File::create(&tmp_path).map_err(|e| e.to_string())?;
+        f.write_all(content.as_bytes()).map_err(|e| e.to_string())?;
+        f.flush().map_err(|e| e.to_string())?;
+    }
+    fs::rename(&tmp_path, &path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Build the chat completion request body.
+/// Pure function for unit testing.
+fn build_chat_body(model: &str, prompt: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "stream": false
+    })
+}
+
+/// Parse chat completion response to extract the assistant's message content.
+/// Pure function for unit testing.
+fn parse_chat_content(resp: &str) -> Result<String, String> {
+    let v: serde_json::Value = serde_json::from_str(resp).map_err(|e| format!("invalid json: {e}"))?;
+    let choices = v.get("choices").and_then(|c| c.as_array()).ok_or("missing choices")?;
+    let first = choices.first().ok_or("empty choices")?;
+    let msg = first.get("message").ok_or("missing message")?;
+    let content = msg.get("content").and_then(|c| c.as_str()).ok_or("missing content")?;
+    Ok(content.to_string())
+}
+
+/// Parse OpenAI-compatible /models response to extract model ids.
+/// Pure function for unit testing.
+fn parse_model_ids(resp: &str) -> Result<Vec<String>, String> {
+    let v: serde_json::Value = serde_json::from_str(resp).map_err(|e| format!("invalid json: {e}"))?;
+    let data = v.get("data").and_then(|d| d.as_array()).ok_or("missing data array")?;
+    let ids: Vec<String> = data
+        .iter()
+        .filter_map(|m| m.get("id").and_then(|id| id.as_str()).map(|s| s.to_string()))
+        .collect();
+    Ok(ids)
+}
+
+/// API generator seat implementation.
+struct ApiGenerator {
+    base_url: String,
+    api_key: String,
+    model: String,
+}
+
+impl Generator for ApiGenerator {
+    fn generate(&mut self, prompt: &str) -> CoreResult<String> {
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let body = build_chat_body(&self.model, prompt);
+        let headers = [
+            ("Authorization", &format!("Bearer {}", self.api_key) as &str),
+            ("Content-Type", "application/json"),
+        ];
+        // Use a generous cap (1 MiB) for the response.
+        let resp = post_json(&url, &headers, &body, 1_048_576)
+            .map_err(|e| CoreError::GeneratorError(format!("network: {e}")))?;
+        parse_chat_content(&resp)
+            .map_err(|e| CoreError::GeneratorError(format!("parse: {e}")))
+    }
+}
+
 
 /// Placeholder embedder (bag-of-words feature hashing), same family
 /// as the core's test fake. Replaced by ruri in stage 6c.
@@ -281,6 +419,7 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_init(
             )
         };
     let gen_name = gen_name_for(root);
+    let (gen_seat, api_config) = load_settings(root);
     let mut guard = match STATE.lock() {
         Ok(g) => g,
         Err(_) => return 0,
@@ -292,6 +431,8 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_init(
         data_dir: root.to_path_buf(),
         gen: None,
         gen_name,
+        api_config,
+        gen_seat,
     });
     1
 }
@@ -374,6 +515,98 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_deleteNotebook(
     }
 }
 
+/// Set API configuration and seat, persist to settings.json.
+/// Returns a short status string.
+#[no_mangle]
+pub extern "C" fn Java_jp_memorianotebook_Bridge_setApiConfig(
+    mut env: JNIEnv,
+    _class: JClass,
+    seat: JString,
+    base_url: JString,
+    api_key: JString,
+    model: JString,
+) -> jstring {
+    let result = (|| -> Result<String, String> {
+        let seat_str = jstring_to_string(&mut env, &seat)?;
+        let base_url = jstring_to_string(&mut env, &base_url)?;
+        let api_key = jstring_to_string(&mut env, &api_key)?;
+        let model = jstring_to_string(&mut env, &model)?;
+
+        let seat = match seat_str.as_str() {
+            "api" => GenSeat::Api,
+            _ => GenSeat::Local,
+        };
+        let config = ApiConfig {
+            base_url,
+            api_key,
+            model,
+        };
+
+        let mut guard = STATE.lock().map_err(|_| "state poisoned".to_string())?;
+        let host = guard.as_mut().ok_or("not initialized")?;
+        save_settings(&host.data_dir, seat, &config)?;
+        host.gen_seat = seat;
+        host.api_config = config;
+        Ok("OK".to_string())
+    })();
+    string_result(&mut env, result)
+}
+
+/// Get current API configuration and seat as JSON for settings prefill.
+#[no_mangle]
+pub extern "C" fn Java_jp_memorianotebook_Bridge_getApiConfig(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let result = with_state(|h| {
+        let seat_str = match h.gen_seat {
+            GenSeat::Local => "local",
+            GenSeat::Api => "api",
+        };
+        Ok(serde_json::json!({
+            "seat": seat_str,
+            "base_url": h.api_config.base_url,
+            "api_key": h.api_config.api_key,
+            "model": h.api_config.model,
+        })
+        .to_string())
+    });
+    string_result(&mut env, result)
+}
+
+/// Fetch available models from an OpenAI-compatible /models endpoint.
+/// Returns JSON array of model ids, or {"error":"..."} on failure.
+#[no_mangle]
+pub extern "C" fn Java_jp_memorianotebook_Bridge_fetchApiModels(
+    mut env: JNIEnv,
+    _class: JClass,
+    base_url: JString,
+    api_key: JString,
+) -> jstring {
+    let result = (|| -> Result<String, String> {
+        let base_url = jstring_to_string(&mut env, &base_url)?;
+        let api_key = jstring_to_string(&mut env, &api_key)?;
+        let url = format!("{}/models", base_url.trim_end_matches('/'));
+        let headers = [("Authorization", &format!("Bearer {}", api_key) as &str)];
+        let resp = get_with_headers(&url, &headers, 1_048_576)
+            .map_err(|e| format!("network: {e}"))?;
+        let ids = parse_model_ids(&resp).map_err(|e| format!("parse: {e}"))?;
+        Ok(serde_json::to_string(&ids).map_err(|e| e.to_string())?)
+    })();
+    let text = match result {
+        Ok(t) => t,
+        Err(e) => {
+            // Sanitize: never include key material.
+            let err_json = serde_json::json!({"error": e}).to_string();
+            err_json
+        }
+    };
+    env.new_string(text)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+
 /// Ask one question; returns the assistant's answer text, or a
 /// string starting with `ERR:` on failure.
 #[no_mangle]
@@ -393,28 +626,39 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_ask(
         }
     };
     let result = with_state(|h| {
-        // Generator seat: the local model, loaded lazily. With no
-        // model on device the ask refuses with guidance — an
-        // unrecorded error, never a faked answer.
-        if h.gen.is_none() {
-            match designated_model(&h.data_dir) {
-                Some(path) => {
-                    let gen = notebook_infer::LlamaGenerator::load(path)?;
-                    h.gen_name = gen_name_for(&h.data_dir);
-                    h.gen = Some(gen);
-                }
-                None => {
-                    return Err(notebook_core::CoreError::GeneratorError(
-                        "モデルが未導入です。設定のモデル管理からダウンロードしてください"
-                            .to_string(),
-                    ));
+        let mut api_generator;
+        let gen: &mut dyn notebook_core::Generator = if h.gen_seat == GenSeat::Api && h.api_config.is_complete() {
+            api_generator = ApiGenerator {
+                base_url: h.api_config.base_url.clone(),
+                api_key: h.api_config.api_key.clone(),
+                model: h.api_config.model.clone(),
+            };
+            &mut api_generator
+        } else {
+            // Generator seat: the local model, loaded lazily. With no
+            // model on device the ask refuses with guidance — an
+            // unrecorded error, never a faked answer.
+            if h.gen.is_none() {
+                match designated_model(&h.data_dir) {
+                    Some(path) => {
+                        let gen = notebook_infer::LlamaGenerator::load(path)?;
+                        h.gen_name = gen_name_for(&h.data_dir);
+                        h.gen = Some(gen);
+                    }
+                    None => {
+                        return Err(notebook_core::CoreError::GeneratorError(
+                            "モデルが未導入です。設定のモデル管理からダウンロードしてください"
+                                .to_string(),
+                        ));
+                    }
                 }
             }
-        }
-        let Some(gen) = h.gen.as_mut() else {
-            return Err(notebook_core::CoreError::GeneratorError(
-                "generator seat empty after load".to_string(),
-            ));
+            let Some(gen) = h.gen.as_mut() else {
+                return Err(notebook_core::CoreError::GeneratorError(
+                    "generator seat empty after load".to_string(),
+                ));
+            };
+            gen
         };
         let turn: ChatTurn =
             h.core
@@ -429,7 +673,6 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_ask(
         .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())
 }
-
 /// Display name of the local generator seat, for the settings
 /// screen ("未導入" until a GGUF sits in the models dir).
 #[no_mangle]
@@ -684,6 +927,8 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_listTurns(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
 
     fn temp_state() -> (CoreState, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
@@ -695,6 +940,116 @@ mod tests {
         ));
         let st = CoreState::new(&dir, EngineCfg::default(), "TinySwallow").unwrap();
         (st, dir)
+    }
+
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nbapp-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn settings_save_load_roundtrip() {
+        let dir = temp_dir();
+        let seat = GenSeat::Api;
+        let config = ApiConfig {
+            base_url: "https://api.example.com/v1".to_string(),
+            api_key: "sk-test123".to_string(),
+            model: "gpt-4o-mini".to_string(),
+        };
+        save_settings(&dir, seat, &config).unwrap();
+        let (loaded_seat, loaded_config) = load_settings(&dir);
+        assert_eq!(loaded_seat, seat);
+        assert_eq!(loaded_config.base_url, config.base_url);
+        assert_eq!(loaded_config.api_key, config.api_key);
+        assert_eq!(loaded_config.model, config.model);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_load_defaults_on_missing() {
+        let dir = temp_dir();
+        let (seat, config) = load_settings(&dir);
+        assert_eq!(seat, GenSeat::Local);
+        assert_eq!(config.base_url, "");
+        assert_eq!(config.api_key, "");
+        assert_eq!(config.model, "");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_load_defaults_on_corrupt() {
+        let dir = temp_dir();
+        fs::write(dir.join(SETTINGS_FILE), "not json").unwrap();
+        let (seat, config) = load_settings(&dir);
+        assert_eq!(seat, GenSeat::Local);
+        assert_eq!(config.base_url, "");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_model_ids_sample() {
+        let payload = r#"{
+            "object": "list",
+            "data": [
+                {"id": "gpt-4o", "object": "model", "owned_by": "openai"},
+                {"id": "gpt-4o-mini", "object": "model", "owned_by": "openai"},
+                {"id": "gpt-3.5-turbo", "object": "model", "owned_by": "openai"}
+            ]
+        }"#;
+        let ids = parse_model_ids(payload).unwrap();
+        assert_eq!(ids, vec!["gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"]);
+    }
+
+    #[test]
+    fn parse_model_ids_missing_data() {
+        let payload = r#"{"object": "list"}"#;
+        let err = parse_model_ids(payload).unwrap_err();
+        assert!(err.contains("missing data array"));
+    }
+
+    #[test]
+    fn parse_chat_content_sample() {
+        let payload = r#"{
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hello, world!"
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        }"#;
+        let content = parse_chat_content(payload).unwrap();
+        assert_eq!(content, "Hello, world!");
+    }
+
+    #[test]
+    fn parse_chat_content_missing_choices() {
+        let payload = r#"{"id": "x"}"#;
+        let err = parse_chat_content(payload).unwrap_err();
+        assert!(err.contains("missing choices"));
+    }
+
+    #[test]
+    fn build_chat_body_shape() {
+        let body = build_chat_body("test-model", "user prompt");
+        assert_eq!(body["model"], "test-model");
+        assert_eq!(body["stream"], false);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "user prompt");
     }
 
     #[test]
@@ -736,3 +1091,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
