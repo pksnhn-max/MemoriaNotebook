@@ -144,6 +144,26 @@ pub struct ChatTurn {
     pub at: u64,
 }
 
+/// Everything `ask_generate` needs, prepared under the state lock:
+/// the built prompts and the retrieved hits they were built from.
+#[derive(Debug, Clone)]
+pub struct AskPrepared {
+    pub nb: u64,
+    pub question: String,
+    pub hits: Vec<(ChunkRec, f32)>,
+    pub grounding: String,
+    pub prompt: String,
+    pub retry_prompt: String,
+}
+
+/// The outcome of `ask_generate`: the final answer text and its
+/// validated citations (empty when the citation gate refused).
+#[derive(Debug, Clone)]
+pub struct GeneratedAnswer {
+    pub text: String,
+    pub citations: Vec<Citation>,
+}
+
 /// The retrieval scope of one notebook: the set of absolute paths the
 /// search is allowed to touch. Design 1 passes the allowed set itself.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -438,14 +458,10 @@ impl CoreState {
         v
     }
 
-    /// Embed all current chunks of `source_id` using `embedder`, append
-    /// vectors to the sidecar, and keep them in memory. Returns the
-    /// number of chunks embedded.
-    pub fn index_source(
-        &mut self,
-        source_id: u64,
-        embedder: &mut dyn Embedder,
-    ) -> CoreResult<usize> {
+    /// Lock-split part 1 of indexing: existence check and the chunk
+    /// list, taken out of the state so the embedding itself can run
+    /// without the state lock (see `embed_chunks` / `index_commit`).
+    pub fn index_prepare(&mut self, source_id: u64) -> CoreResult<Vec<(u64, String)>> {
         if !self.sources.iter().any(|s| s.id == source_id) {
             return Err(CoreError::SourceNotFound(source_id));
         }
@@ -454,27 +470,32 @@ impl CoreState {
             .into_iter()
             .map(|c| (c.id, c.text.clone()))
             .collect();
+        Ok(chunks)
+    }
+
+    /// Lock-split part 3 of indexing: merge the pairs embedded outside
+    /// the lock into the in-memory embedding map.
+    pub fn index_commit(&mut self, pairs: Vec<(u64, Vec<f32>)>) {
+        for (chunk_id, vec) in pairs {
+            self.embeddings.insert(chunk_id, vec);
+        }
+    }
+
+    /// Embed all current chunks of `source_id` using `embedder`, append
+    /// vectors to the sidecar, and keep them in memory. Returns the
+    /// number of chunks embedded.
+    pub fn index_source(
+        &mut self,
+        source_id: u64,
+        embedder: &mut dyn Embedder,
+    ) -> CoreResult<usize> {
+        let chunks = self.index_prepare(source_id)?;
         if chunks.is_empty() {
             return Ok(0);
         }
-        let path = self.data_dir.join("emb_chunks.bin");
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let mut count = 0;
-        for (chunk_id, chunk_text) in chunks {
-            let vec = embedder.embed(&chunk_text)?;
-            // Write record: chunk_id (u64 LE), dim (u32 LE), f32[dim] LE
-            file.write_all(&chunk_id.to_le_bytes())?;
-            let dim = vec.len() as u32;
-            file.write_all(&dim.to_le_bytes())?;
-            for v in &vec {
-                file.write_all(&v.to_le_bytes())?;
-            }
-            file.flush()?;
-            self.embeddings.insert(chunk_id, vec);
-            count += 1;
-        }
-        file.sync_all()?;
-        Ok(count)
+        let (pairs, res) = embed_chunks(chunks, embedder, &self.data_dir);
+        self.index_commit(pairs);
+        res
     }
 
     /// Search within notebook `nb` for chunks similar to `query` vector.
@@ -537,6 +558,72 @@ impl CoreState {
         scope
     }
 
+    /// Lock-split part 1 of ask: notebook check, question embedding,
+    /// retrieval, and prompt construction. Everything the generation
+    /// phase needs, taken out of the state so generation itself can
+    /// run without the state lock (see `ask_generate` / `ask_commit`).
+    pub fn ask_prepare(
+        &mut self,
+        nb: u64,
+        question: &str,
+        embedder: &mut dyn Embedder,
+        top_k: usize,
+    ) -> CoreResult<AskPrepared> {
+        if !self.notebooks.iter().any(|n| n.id == nb) {
+            return Err(CoreError::NotebookNotFound(nb));
+        }
+        let qvec = embedder.embed(question)?;
+        let hits = self.search(nb, &qvec, top_k);
+        let grounding = if hits.is_empty() {
+            "（該当する資料なし）".to_string()
+        } else {
+            format_grounding(&hits)
+        };
+        let prompt = format!(
+            "あなたはノートの資料だけに基づいて答えるアシスタントです。資料に無いことは「資料にありません」と答えてください。資料の各断片には [#番号] の印が付いています。主張の根拠にした断片の印を、文の末尾にそのまま書いてください。\n\n資料:\n{}\n\n質問:\n{}",
+            grounding, question
+        );
+        let retry_prompt = format!(
+            "前回の回答は出典の印が一つも無かったため却下されました。資料の断片だけを使って答え直してください。主張する文の末尾には、根拠にした断片の印 [#番号] を必ずそのまま書いてください。断片の中に答えが無ければ「資料にありません」とだけ答えてください。\n\n資料:\n{}\n\n質問:\n{}",
+            grounding, question
+        );
+        Ok(AskPrepared {
+            nb,
+            question: question.to_string(),
+            hits,
+            grounding,
+            prompt,
+            retry_prompt,
+        })
+    }
+
+    /// Lock-split part 3 of ask: record the user turn, then the
+    /// assistant turn, in that order.
+    pub fn ask_commit(
+        &mut self,
+        prepared: AskPrepared,
+        answer: GeneratedAnswer,
+        at: u64,
+    ) -> CoreResult<ChatTurn> {
+        let user_turn = ChatTurn {
+            nb: prepared.nb,
+            role: Role::User,
+            text: prepared.question,
+            citations: vec![],
+            at,
+        };
+        self.append_turn(&user_turn)?;
+        let assistant_turn = ChatTurn {
+            nb: prepared.nb,
+            role: Role::Assistant,
+            text: answer.text,
+            citations: answer.citations,
+            at,
+        };
+        self.append_turn(&assistant_turn)?;
+        Ok(assistant_turn)
+    }
+
     /// Ask one question against notebook `nb`: embed the question,
     /// retrieve grounding chunks, build the citation-bound prompt,
     /// generate, validate citations, and record both turns. On any
@@ -557,69 +644,80 @@ impl CoreState {
         top_k: usize,
         at: u64,
     ) -> CoreResult<ChatTurn> {
-        if !self.notebooks.iter().any(|n| n.id == nb) {
-            return Err(CoreError::NotebookNotFound(nb));
+        let prepared = self.ask_prepare(nb, question, embedder, top_k)?;
+        let answer = ask_generate(&prepared, generator)?;
+        self.ask_commit(prepared, answer, at)
+    }
+}
+
+/// Lock-split part 2 of ask: generation plus the citation gate, as a
+/// free function over the prepared prompts — no state lock is held
+/// while the generator runs.
+pub fn ask_generate(
+    prepared: &AskPrepared,
+    generator: &mut dyn Generator,
+) -> CoreResult<GeneratedAnswer> {
+    let mut generated_text = generator.generate(&prepared.prompt)?;
+    let mut citations = parse_citations(&generated_text, &prepared.hits);
+    if citations.is_empty() && !prepared.hits.is_empty() {
+        generated_text = generator.generate(&prepared.retry_prompt)?;
+        citations = parse_citations(&generated_text, &prepared.hits);
+        if citations.is_empty() {
+            generated_text = "資料にありません。".to_string();
         }
-        // 1. 質問を埋め込み
-        let qvec = embedder.embed(question)?;
+    }
+    Ok(GeneratedAnswer {
+        text: generated_text,
+        citations,
+    })
+}
 
-        // 2. 根拠を引く
-        let hits = self.search(nb, &qvec, top_k);
-
-        // 3. プロンプトを組む
-        let grounding = if hits.is_empty() {
-            "（該当する資料なし）".to_string()
-        } else {
-            format_grounding(&hits)
+/// Lock-split part 2 of indexing: embed `chunks` and append the
+/// vectors to `data_dir/emb_chunks.bin` (record: chunk_id u64 LE,
+/// dim u32 LE, f32[dim] LE; flush per record, sync_all at the end).
+/// Returns the pairs that were written together with the outcome, so
+/// partial progress is preserved exactly as the unsplit code did: on
+/// an error the pairs written so far still come back for committing.
+pub fn embed_chunks(
+    chunks: Vec<(u64, String)>,
+    embedder: &mut dyn Embedder,
+    data_dir: &Path,
+) -> (Vec<(u64, Vec<f32>)>, CoreResult<usize>) {
+    let path = data_dir.join("emb_chunks.bin");
+    let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(f) => f,
+        Err(e) => return (Vec::new(), Err(CoreError::Io(e))),
+    };
+    let mut written: Vec<(u64, Vec<f32>)> = Vec::with_capacity(chunks.len());
+    let mut count = 0usize;
+    for (chunk_id, chunk_text) in chunks {
+        let vec = match embedder.embed(&chunk_text) {
+            Ok(v) => v,
+            Err(e) => return (written, Err(e)),
         };
-
-        let prompt = format!(
-            "あなたはノートの資料だけに基づいて答えるアシスタントです。資料に無いことは「資料にありません」と答えてください。資料の各断片には [#番号] の印が付いています。主張の根拠にした断片の印を、文の末尾にそのまま書いてください。\n\n資料:\n{}\n\n質問:\n{}",
-            grounding, question
-        );
-
-        // 4. 生成
-        let mut generated_text = generator.generate(&prompt)?;
-
-        // 5. 検証（parse_citations）
-        let mut citations = parse_citations(&generated_text, &hits);
-
-        // 5b. 出典の門：根拠の断片があるのに有効な出典が一つも無い
-        // 答えは、そのまま通さない。一度だけプロンプトを組み直して
-        // 再生成し、それでも出典が無ければ固定の拒否文を答えとする。
-        if citations.is_empty() && !hits.is_empty() {
-            let retry_prompt = format!(
-                "前回の回答は出典の印が一つも無かったため却下されました。資料の断片だけを使って答え直してください。主張する文の末尾には、根拠にした断片の印 [#番号] を必ずそのまま書いてください。断片の中に答えが無ければ「資料にありません」とだけ答えてください。\n\n資料:\n{}\n\n質問:\n{}",
-                grounding, question
-            );
-            generated_text = generator.generate(&retry_prompt)?;
-            citations = parse_citations(&generated_text, &hits);
-            if citations.is_empty() {
-                generated_text = "資料にありません。".to_string();
+        // Write record: chunk_id (u64 LE), dim (u32 LE), f32[dim] LE
+        if let Err(e) = file.write_all(&chunk_id.to_le_bytes()) {
+            return (written, Err(CoreError::Io(e)));
+        }
+        let dim = vec.len() as u32;
+        if let Err(e) = file.write_all(&dim.to_le_bytes()) {
+            return (written, Err(CoreError::Io(e)));
+        }
+        for v in &vec {
+            if let Err(e) = file.write_all(&v.to_le_bytes()) {
+                return (written, Err(CoreError::Io(e)));
             }
         }
-
-        // 6. ターン記録（ユーザー → アシスタント）
-        let user_turn = ChatTurn {
-            nb,
-            role: Role::User,
-            text: question.to_string(),
-            citations: vec![],
-            at,
-        };
-        self.append_turn(&user_turn)?;
-
-        let assistant_turn = ChatTurn {
-            nb,
-            role: Role::Assistant,
-            text: generated_text,
-            citations,
-            at,
-        };
-        self.append_turn(&assistant_turn)?;
-
-        Ok(assistant_turn)
+        if let Err(e) = file.flush() {
+            return (written, Err(CoreError::Io(e)));
+        }
+        written.push((chunk_id, vec));
+        count += 1;
     }
+    if let Err(e) = file.sync_all() {
+        return (written, Err(CoreError::Io(e)));
+    }
+    (written, Ok(count))
 }
 
 /// Target chunk size in characters (paragraph units, roughly 400).

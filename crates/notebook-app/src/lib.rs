@@ -36,7 +36,7 @@ use notebook_net::{get_with_headers, post_json};
 /// fallback is visible, never silent.
 struct Host {
     core: CoreState,
-    emb: Box<dyn Embedder + Send>,
+    emb: Option<Box<dyn Embedder + Send>>,
     emb_name: String,
     data_dir: std::path::PathBuf,
     /// The local generator seat: loaded lazily on the first ask
@@ -444,7 +444,7 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_init(
     };
     *guard = Some(Host {
         core,
-        emb,
+        emb: Some(emb),
         emb_name,
         data_dir: root.to_path_buf(),
         gen: None,
@@ -491,6 +491,37 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_createNotebook(
     .unwrap_or(-1)
 }
 
+/// Shared tail of the add-source bridges: register the source, set
+/// its text, and index it — with the embedding itself done outside
+/// the STATE lock (prepare under the lock, embed unlocked, commit
+/// under the lock), so a long text no longer stalls every other
+/// bridge call. The embedder seat is taken out for the middle phase
+/// and always put back; pairs embedded before an error are still
+/// committed, exactly as the unsplit `index_source` left them.
+/// Returns the source id.
+fn add_and_index(
+    nb: u64,
+    title: &str,
+    locator: &str,
+    text: &str,
+) -> Result<jlong, String> {
+    let (src_id, chunks, data_dir, mut emb) = with_state(|h| {
+        let src = h.core.add_source(nb, SourceKind::Text, title, locator, 0)?;
+        h.core.set_source_text(src.id, text)?;
+        let chunks = h.core.index_prepare(src.id)?;
+        let emb = h.emb.take().ok_or_else(|| {
+            notebook_core::CoreError::GeneratorError("embedder seat empty".to_string())
+        })?;
+        Ok((src.id, chunks, h.data_dir.clone(), emb))
+    })?;
+    let (pairs, res) = notebook_core::embed_chunks(chunks, &mut *emb, &data_dir);
+    with_state(|h| {
+        h.emb = Some(emb);
+        h.core.index_commit(pairs);
+        res.map(|_| src_id as jlong)
+    })
+}
+
 /// Add a plain-text source to notebook `nb`, set its text and index
 /// it in one call (6a convenience). Returns the source id, or -1.
 #[no_mangle]
@@ -509,15 +540,7 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_addTextSource(
         Ok(t) => t,
         Err(_) => return -1,
     };
-    with_state(|h| {
-        let src = h
-            .core
-            .add_source(nb as u64, SourceKind::Text, &title, "", 0)?;
-        h.core.set_source_text(src.id, &text)?;
-        h.core.index_source(src.id, &mut *h.emb)?;
-        Ok(src.id as jlong)
-    })
-    .unwrap_or(-1)
+    add_and_index(nb as u64, &title, "", &text).unwrap_or(-1)
 }
 
 /// Delete (tombstone) a notebook; false on failure.
@@ -627,6 +650,12 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_fetchApiModels(
 
 /// Ask one question; returns the assistant's answer text, or a
 /// string starting with `ERR:` on failure.
+///
+/// Three phases so the STATE lock is never held while the generator
+/// runs: prepare (embed the question, retrieve, build the prompts)
+/// under the lock, generate outside it, then commit (record both
+/// turns) under the lock again. The local generator is taken out of
+/// its seat for the middle phase and always put back, error or not.
 #[no_mangle]
 pub extern "C" fn Java_jp_memorianotebook_Bridge_ask(
     mut env: JNIEnv,
@@ -643,16 +672,20 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_ask(
                 .unwrap_or(std::ptr::null_mut())
         }
     };
-    let result = with_state(|h| {
-        let mut api_generator;
-        let gen: &mut dyn notebook_core::Generator = if h.gen_seat == GenSeat::Api && h.api_config.is_complete() {
-            api_generator = ApiGenerator {
-                base_url: h.api_config.base_url.clone(),
-                api_key: h.api_config.api_key.clone(),
-                model: h.api_config.model.clone(),
-            };
-            &mut api_generator
-        } else {
+    // Phase 1 (lock held): prepare; snapshot the seat decision; for
+    // the local seat, load the model if needed and take the generator
+    // out of its seat.
+    let phase1 = with_state(|h| {
+        let use_api = h.gen_seat == GenSeat::Api && h.api_config.is_complete();
+        let api_config = h.api_config.clone();
+        let Some(emb) = h.emb.as_mut() else {
+            return Err(notebook_core::CoreError::GeneratorError(
+                "embedder seat empty".to_string(),
+            ));
+        };
+        let prepared = h.core.ask_prepare(nb as u64, &question, &mut **emb, 5)?;
+        let mut taken = None;
+        if !use_api {
             // Generator seat: the local model, loaded lazily. With no
             // model on device the ask refuses with guidance — an
             // unrecorded error, never a faked answer.
@@ -671,21 +704,44 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_ask(
                     }
                 }
             }
-            let Some(gen) = h.gen.as_mut() else {
-                return Err(notebook_core::CoreError::GeneratorError(
-                    "generator seat empty after load".to_string(),
-                ));
-            };
-            gen
-        };
-        let turn: ChatTurn =
-            h.core
-                .ask(nb as u64, &question, &mut *h.emb, gen, 5, 0)?;
-        Ok(turn.text)
+            taken = h.gen.take();
+        }
+        Ok((prepared, use_api, api_config, taken))
     });
-    let text = match result {
-        Ok(t) => t,
+    let text = match phase1 {
         Err(e) => format!("ERR: {e}"),
+        Ok((prepared, use_api, api_config, mut taken)) => {
+            // Phase 2 (no lock): generate.
+            let answer = if use_api {
+                let mut api_generator = ApiGenerator {
+                    base_url: api_config.base_url.clone(),
+                    api_key: api_config.api_key.clone(),
+                    model: api_config.model.clone(),
+                };
+                notebook_core::ask_generate(&prepared, &mut api_generator)
+            } else {
+                match taken.as_mut() {
+                    Some(gen) => notebook_core::ask_generate(&prepared, gen),
+                    None => Err(notebook_core::CoreError::GeneratorError(
+                        "generator seat empty after load".to_string(),
+                    )),
+                }
+            };
+            // Phase 3 (lock held): put the generator back first, then
+            // commit — a generation error still restores the seat.
+            let committed = with_state(|h| {
+                if let Some(gen) = taken.take() {
+                    h.gen = Some(gen);
+                }
+                let answer = answer?;
+                let turn = h.core.ask_commit(prepared, answer, 0)?;
+                Ok(turn.text)
+            });
+            match committed {
+                Ok(t) => t,
+                Err(e) => format!("ERR: {e}"),
+            }
+        }
     };
     env.new_string(text)
         .map(|s| s.into_raw())
@@ -841,15 +897,7 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_addFileSource(
     } else {
         notebook_extract::extract_txt(&raw)
     };
-    with_state(|h| {
-        let src = h
-            .core
-            .add_source(nb as u64, SourceKind::Text, &title, "", 0)?;
-        h.core.set_source_text(src.id, &text)?;
-        h.core.index_source(src.id, &mut *h.emb)?;
-        Ok(src.id as jlong)
-    })
-    .unwrap_or(-1)
+    add_and_index(nb as u64, &title, "", &text).unwrap_or(-1)
 }
 
 /// Web search; one hit per line: `title \t url \t snippet`,
@@ -886,14 +934,7 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_addWebSource(
         let title = jstring_to_string(&mut env, &title)?;
         let url = jstring_to_string(&mut env, &url)?;
         let text = notebook_net::fetch_page_text(&url).map_err(|e| e.to_string())?;
-        let id = with_state(|h| {
-            let src = h
-                .core
-                .add_source(nb as u64, SourceKind::Text, &title, &url, 0)?;
-            h.core.set_source_text(src.id, &text)?;
-            h.core.index_source(src.id, &mut *h.emb)?;
-            Ok(src.id as jlong)
-        })?;
+        let id = add_and_index(nb as u64, &title, &url, &text)?;
         Ok(format!("OK {id}"))
     })();
     string_result(&mut env, result)

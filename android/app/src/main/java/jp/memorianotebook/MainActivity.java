@@ -1518,16 +1518,31 @@ private void showSettings() {
         srcBody.setBackgroundColor(Color.TRANSPARENT);
         srcBody.setMinLines(4);
         add.addView(srcBody);
-        Button addBtn = pillBtn("テキスト資料を追加");
+        final Button addBtn = pillBtn("テキスト資料を追加");
         addBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 String t = srcTitle.getText().toString().trim();
-                String b = srcBody.getText().toString();
+                final String b = srcBody.getText().toString();
                 if (b.trim().isEmpty()) return;
                 if (t.isEmpty()) t = "テキスト資料";
-                Bridge.addTextSource(currentNb, t, b);
-                showNotebook(currentNb, currentTitle, 0);
+                final String title = t;
+                final long nb = currentNb;
+                final long[] newId = new long[1];
+                addBtn.setEnabled(false);
+                addBtn.setText("索引作成中…");
+                runBg(new Runnable() {
+                    @Override
+                    public void run() {
+                        newId[0] = Bridge.addTextSource(nb, title, b);
+                    }
+                }, new Runnable() {
+                    @Override
+                    public void run() {
+                        if (newId[0] < 0) toast("資料を追加できませんでした");
+                        showNotebook(currentNb, currentTitle, 0);
+                    }
+                });
             }
         });
         add.addView(addBtn);
