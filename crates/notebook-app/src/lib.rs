@@ -17,7 +17,7 @@
 //! The JNI class is `jp.memorianotebook.Bridge` — provisional until
 //! the package name is ruled.
 
-use jni::objects::{JClass, JString};
+use jni::objects::{JClass, JString, JValue};
 use jni::sys::{jboolean, jlong, jstring};
 use jni::JNIEnv;
 use notebook_core::{ChatTurn, CoreResult, CoreState, Embedder, EngineCfg, SourceKind};
@@ -339,10 +339,52 @@ fn fmt_chunk(st: &CoreState, chunk_id: u64) -> String {
     }
 }
 
-fn with_state<T>(f: impl FnOnce(&mut Host) -> CoreResult<T>) -> Result<T, String> {
-    let mut guard = STATE.lock().map_err(|_| "state poisoned".to_string())?;
-    let host = guard.as_mut().ok_or("not initialized")?;
-    f(host).map_err(|e| e.to_string())
+/// Machine-readable kind of a core error, carried across the
+/// bridge in the `ERR:<kind>: <message>` wire form so the UI can
+/// branch on the kind instead of matching message text (the seam
+/// pattern used by UniFFI/Tauri-style bridges: typed errors, not
+/// stringly ones).
+fn err_kind(e: &CoreError) -> &'static str {
+    match e {
+        CoreError::Io(_) => "io",
+        CoreError::Json(_) => "json",
+        CoreError::NotebookNotFound(_) => "notebook_not_found",
+        CoreError::SourceNotFound(_) => "source_not_found",
+        CoreError::GeneratorError(_) => "generator",
+    }
+}
+
+/// Format a core error for the bridge wire: `ERR:<kind>: <message>`.
+fn err_wire(e: &CoreError) -> String {
+    format!("ERR:{}: {}", err_kind(e), e)
+}
+
+/// Best-effort push to the Java side: `Bridge.onNativeEvent(kind,
+/// payload)`. Events are a display convenience (streamed tokens,
+/// download progress), never load-bearing, so every failure —
+/// including a Java exception — is swallowed after clearing it.
+fn emit_event(env: &mut JNIEnv, class: &JClass, kind: &str, payload: &str) {
+    let Ok(k) = env.new_string(kind) else { return };
+    let Ok(p) = env.new_string(payload) else { return };
+    let _ = env.call_static_method(
+        class,
+        "onNativeEvent",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        &[JValue::from(&k), JValue::from(&p)],
+    );
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
+    }
+}
+
+fn with_state<T>(f: impl FnOnce(&mut Host) -> CoreResult<T>) -> Result<T, CoreError> {
+    let mut guard = STATE
+        .lock()
+        .map_err(|_| CoreError::GeneratorError("state poisoned".to_string()))?;
+    let host = guard
+        .as_mut()
+        .ok_or_else(|| CoreError::GeneratorError("not initialized".to_string()))?;
+    f(host)
 }
 
 fn jstring_to_string(env: &mut JNIEnv, s: &JString) -> Result<String, String> {
@@ -513,13 +555,13 @@ fn add_and_index(
             notebook_core::CoreError::GeneratorError("embedder seat empty".to_string())
         })?;
         Ok((src.id, chunks, h.data_dir.clone(), emb))
-    })?;
+    }).map_err(|e| err_wire(&e))?;
     let (pairs, res) = notebook_core::embed_chunks(chunks, &mut *emb, &data_dir);
     with_state(|h| {
         h.emb = Some(emb);
         h.core.index_commit(pairs);
         res.map(|_| src_id as jlong)
-    })
+    }).map_err(|e| err_wire(&e))
 }
 
 /// Add a plain-text source to notebook `nb`, set its text and index
@@ -612,7 +654,7 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_getApiConfig(
         })
         .to_string())
     });
-    string_result(&mut env, result)
+    string_result(&mut env, result.map_err(|e| err_wire(&e)))
 }
 
 /// Fetch available models from an OpenAI-compatible /models endpoint.
@@ -659,7 +701,7 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_fetchApiModels(
 #[no_mangle]
 pub extern "C" fn Java_jp_memorianotebook_Bridge_ask(
     mut env: JNIEnv,
-    _class: JClass,
+    class: JClass,
     nb: jlong,
     question: JString,
 ) -> jstring {
@@ -667,7 +709,7 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_ask(
         Ok(q) => q,
         Err(e) => {
             return env
-                .new_string(format!("ERR: {e}"))
+                .new_string(format!("ERR:bad_input: {e}"))
                 .map(|s| s.into_raw())
                 .unwrap_or(std::ptr::null_mut())
         }
@@ -709,19 +751,29 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_ask(
         Ok((prepared, use_api, api_config, taken))
     });
     let text = match phase1 {
-        Err(e) => format!("ERR: {e}"),
+        Err(e) => err_wire(&e),
         Ok((prepared, use_api, api_config, mut taken)) => {
-            // Phase 2 (no lock): generate.
+            // Phase 2 (no lock): generate. Pieces stream to the
+            // Java side as they form (provisional until the gate
+            // has judged the attempt; a reset discards them).
+            let mut sink = |ev: notebook_core::StreamEvent| match ev {
+                notebook_core::StreamEvent::Token(piece) => {
+                    emit_event(&mut env, &class, "token", &piece)
+                }
+                notebook_core::StreamEvent::Reset => {
+                    emit_event(&mut env, &class, "stream_reset", "")
+                }
+            };
             let answer = if use_api {
                 let mut api_generator = ApiGenerator {
                     base_url: api_config.base_url.clone(),
                     api_key: api_config.api_key.clone(),
                     model: api_config.model.clone(),
                 };
-                notebook_core::ask_generate(&prepared, &mut api_generator)
+                notebook_core::ask_generate_with_sink(&prepared, &mut api_generator, &mut sink)
             } else {
                 match taken.as_mut() {
-                    Some(gen) => notebook_core::ask_generate(&prepared, gen),
+                    Some(gen) => notebook_core::ask_generate_with_sink(&prepared, gen, &mut sink),
                     None => Err(notebook_core::CoreError::GeneratorError(
                         "generator seat empty after load".to_string(),
                     )),
@@ -739,7 +791,7 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_ask(
             });
             match committed {
                 Ok(t) => t,
-                Err(e) => format!("ERR: {e}"),
+                Err(e) => err_wire(&e),
             }
         }
     };
@@ -807,7 +859,7 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_listModelFiles(
 #[no_mangle]
 pub extern "C" fn Java_jp_memorianotebook_Bridge_downloadModel(
     mut env: JNIEnv,
-    _class: JClass,
+    class: JClass,
     repo: JString,
     file: JString,
 ) -> jstring {
@@ -853,7 +905,18 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_downloadModel(
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let dest = dir.join(&file);
         let url = notebook_net::hf_resolve_url(&repo, &file);
-        let n = notebook_net::download_to_file(&url, &dest, |_, _| {})
+        let mut last_pct: u64 = u64::MAX;
+        let progress = |done: u64, total: u64| {
+            if total == 0 {
+                return;
+            }
+            let pct = done * 100 / total;
+            if pct != last_pct {
+                last_pct = pct;
+                emit_event(&mut env, &class, "progress", &format!("model:{pct}"));
+            }
+        };
+        let n = notebook_net::download_to_file(&url, &dest, progress)
             .map_err(|e| e.to_string())?;
         {
             let mut guard = STATE.lock().map_err(|_| "state poisoned".to_string())?;
@@ -943,7 +1006,9 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_addWebSource(
 fn string_result(env: &mut JNIEnv, result: Result<String, String>) -> jstring {
     let text = match result {
         Ok(t) => t,
-        Err(e) => format!("ERR: {e}"),
+        // Already in the typed wire form: pass through untouched.
+        Err(e) if e.starts_with("ERR:") => e,
+        Err(e) => format!("ERR:error: {e}"),
     };
     env.new_string(text)
         .map(|s| s.into_raw())
@@ -957,7 +1022,7 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_listNotebooks(
     _class: JClass,
 ) -> jstring {
     let result = with_state(|h| Ok(fmt_notebooks(&h.core)));
-    string_result(&mut env, result)
+    string_result(&mut env, result.map_err(|e| err_wire(&e)))
 }
 
 /// List sources of notebook `nb`, one per line: `id \t title`.
@@ -968,7 +1033,7 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_listSources(
     nb: jlong,
 ) -> jstring {
     let result = with_state(|h| Ok(fmt_sources(&h.core, nb as u64)));
-    string_result(&mut env, result)
+    string_result(&mut env, result.map_err(|e| err_wire(&e)))
 }
 
 /// List chat turns of notebook `nb`, one per line:
@@ -980,7 +1045,7 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_listTurns(
     nb: jlong,
 ) -> jstring {
     let result = with_state(|h| fmt_turns(&h.core, nb as u64));
-    string_result(&mut env, result)
+    string_result(&mut env, result.map_err(|e| err_wire(&e)))
 }
 
 /// Fetch one cited chunk for the viewer: `source title \t chunk
@@ -993,7 +1058,7 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_getChunk(
     chunk_id: jlong,
 ) -> jstring {
     let result = with_state(|h| Ok(fmt_chunk(&h.core, chunk_id as u64)));
-    string_result(&mut env, result)
+    string_result(&mut env, result.map_err(|e| err_wire(&e)))
 }
 
 #[cfg(test)]
@@ -1214,7 +1279,7 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_getVoiceCatalog(
             .collect();
         Ok(serde_json::to_string(&catalog).unwrap_or_else(|_| "[]".to_string()))
     });
-    string_result(&mut env, result)
+    string_result(&mut env, result.map_err(|e| err_wire(&e)))
 }
 
 #[no_mangle]
@@ -1235,13 +1300,13 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_recordVoiceConsent(
             .map_err(notebook_core::CoreError::GeneratorError)?;
         Ok("OK".to_string())
     });
-    string_result(&mut env, result)
+    string_result(&mut env, result.map_err(|e| err_wire(&e)))
 }
 
 #[no_mangle]
 pub extern "C" fn Java_jp_memorianotebook_Bridge_downloadVoice(
     mut env: JNIEnv,
-    _class: JClass,
+    class: JClass,
     key: JString,
 ) -> jstring {
     let key_str = match jstring_to_string(&mut env, &key) {
@@ -1298,7 +1363,24 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_downloadVoice(
     if dest.exists() {
         return string_result(&mut env, Ok("OK 0".to_string()));
     }
-    let result = notebook_net::download_to_file(&entry.vvm_url(), &dest, |_, _| {})
+    let voice_key = entry.key;
+    let mut last_pct: u64 = u64::MAX;
+    let progress = |done: u64, total: u64| {
+        if total == 0 {
+            return;
+        }
+        let pct = done * 100 / total;
+        if pct != last_pct {
+            last_pct = pct;
+            emit_event(
+                &mut env,
+                &class,
+                "progress",
+                &format!("voice:{voice_key}:{pct}"),
+            );
+        }
+    };
+    let result = notebook_net::download_to_file(&entry.vvm_url(), &dest, progress)
         .map(|n| format!("OK {n}"))
         .map_err(|e| e.to_string());
     string_result(&mut env, result)
@@ -1324,7 +1406,7 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_setVoicePair(
             .map_err(notebook_core::CoreError::GeneratorError)?;
         Ok("OK".to_string())
     });
-    string_result(&mut env, result)
+    string_result(&mut env, result.map_err(|e| err_wire(&e)))
 }
 
 #[no_mangle]
@@ -1339,7 +1421,7 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_listVoiceSummaries(
         summaries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         Ok(serde_json::to_string(&summaries).unwrap_or_else(|_| "[]".to_string()))
     });
-    string_result(&mut env, result)
+    string_result(&mut env, result.map_err(|e| err_wire(&e)))
 }
 
 #[no_mangle]
@@ -1357,7 +1439,7 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_deleteVoiceSummary(
         }
         Ok("OK".to_string())
     });
-    string_result(&mut env, result)
+    string_result(&mut env, result.map_err(|e| err_wire(&e)))
 }
 
 #[no_mangle]
@@ -1459,7 +1541,7 @@ pub extern "C" fn Java_jp_memorianotebook_Bridge_generateVoiceSummary(
         })
     }) {
         Ok(snap) => snap,
-        Err(e) => return string_result(&mut env, Err(e)),
+        Err(e) => return string_result(&mut env, Err(err_wire(&e))),
     };
     let result: Result<String, String> = (|| {
         use notebook_core::Generator as _;

@@ -59,4 +59,26 @@ public final class Bridge {
     public static native String listVoiceSummaries(long notebookId);
     /** Delete one audio summary and its WAV file. "OK" or ERR:. */
     public static native String deleteVoiceSummary(long id);
+
+    /** Listener for events pushed from the Rust side (streamed
+     *  answer pieces, download progress). */
+    public interface NativeEventListener {
+        void onNativeEvent(String kind, String payload);
+    }
+
+    private static volatile NativeEventListener eventListener;
+
+    public static void setEventListener(NativeEventListener listener) {
+        eventListener = listener;
+    }
+
+    /** Called from Rust (JNI) on whatever thread is generating or
+     *  downloading; the listener is responsible for hopping to the
+     *  UI thread. Best-effort: no listener, no events. */
+    public static void onNativeEvent(String kind, String payload) {
+        NativeEventListener l = eventListener;
+        if (l != null) {
+            l.onNativeEvent(kind, payload);
+        }
+    }
 }

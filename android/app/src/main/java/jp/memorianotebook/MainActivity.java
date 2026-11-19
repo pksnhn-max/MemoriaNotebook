@@ -73,6 +73,10 @@ public final class MainActivity extends Activity {
     private String hfFileRepo = "";
     private String[][] hfFiles = new String[0][];
     private final java.util.Set<String> voiceDownloading = new java.util.HashSet<>();
+    private TextView streamBubble;
+    private final StringBuilder streamBuf = new StringBuilder();
+    private TextView progressSink;
+    private String progressSinkKey;
     private android.media.MediaPlayer player;
     private android.os.Handler playerHandler;
     private Runnable playerTick;
@@ -173,6 +177,31 @@ public final class MainActivity extends Activity {
         return b.toString();
     }
 
+    /** Bridge errors arrive as `ERR:<kind>: <message>`. The kind is
+     *  machine-readable (io, generator, notebook_not_found, ...) so
+     *  the UI can branch on it; this returns just the human message
+     *  for display. Older untyped `ERR: <message>` strings also parse. */
+    private static String errMsg(String raw) {
+        if (raw == null) return "";
+        if (!raw.startsWith("ERR:")) return raw;
+        String rest = raw.substring(4).trim();
+        int i = rest.indexOf(": ");
+        if (i > 0 && rest.substring(0, i).matches("[a-z_]+")) {
+            return rest.substring(i + 2);
+        }
+        return rest;
+    }
+
+    private static String errKind(String raw) {
+        if (raw == null || !raw.startsWith("ERR:")) return "";
+        String rest = raw.substring(4).trim();
+        int i = rest.indexOf(": ");
+        if (i > 0 && rest.substring(0, i).matches("[a-z_]+")) {
+            return rest.substring(0, i);
+        }
+        return "";
+    }
+
     private static String[][] lines(String raw) {
         if (raw == null || raw.isEmpty() || raw.startsWith("ERR:")) {
             return new String[0][];
@@ -244,6 +273,17 @@ public final class MainActivity extends Activity {
         });
         setContentView(root);
 
+        Bridge.setEventListener(new Bridge.NativeEventListener() {
+            @Override
+            public void onNativeEvent(final String kind, final String payload) {
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        onNativeEventUi(kind, payload);
+                    }
+                });
+            }
+        });
         extractRuriAssets();
         try {
             String ortPath = getApplicationInfo().nativeLibraryDir
@@ -319,7 +359,42 @@ public final class MainActivity extends Activity {
         }
     }
 
+    /** Events pushed from the Rust side, already on the UI thread:
+     *  "token" pieces of the streaming answer, "stream_reset" when
+     *  the citation gate discards a provisional attempt, and
+     *  "progress" (model:<pct> / voice:<key>:<pct>) for downloads. */
+    private void onNativeEventUi(String kind, String payload) {
+        if ("token".equals(kind)) {
+            if (streamBubble != null) {
+                streamBuf.append(payload);
+                streamBubble.setText(streamBuf.toString());
+                scroll.fullScroll(android.view.View.FOCUS_DOWN);
+            }
+        } else if ("stream_reset".equals(kind)) {
+            streamBuf.setLength(0);
+            if (streamBubble != null) {
+                streamBubble.setText("");
+            }
+        } else if ("progress".equals(kind)) {
+            if (progressSink == null || progressSinkKey == null) return;
+            int cut = payload.lastIndexOf(':');
+            if (cut < 0) return;
+            String head = payload.substring(0, cut);
+            String pct = payload.substring(cut + 1);
+            boolean match = head.equals("model")
+                    ? progressSinkKey.equals("model")
+                    : head.startsWith("voice:")
+                            && head.substring(6).equals(progressSinkKey);
+            if (match) {
+                progressSink.setText("ダウンロード中… " + pct + "%");
+            }
+        }
+    }
+
     private void clearScreen() {
+        streamBubble = null;
+        progressSink = null;
+        progressSinkKey = null;
         screen.removeAllViews();
         bottomBar.removeAllViews();
         scroll.scrollTo(0, 0);
@@ -753,6 +828,8 @@ private void showSettings() {
                 public void onClick(View v) {
                     dl.setEnabled(false);
                     dl.setText("ダウンロード中…（約1.1 GB）");
+                    progressSink = dl;
+                    progressSinkKey = "model";
                     final String[] res = new String[1];
                     runBg(new Runnable() {
                         @Override
@@ -817,7 +894,7 @@ private void showSettings() {
                     public void run() {
                         hfGo.setEnabled(true);
                         if (raw[0] != null && raw[0].startsWith("ERR:")) {
-                            toast(raw[0].substring(4).trim());
+                            toast(errMsg(raw[0]));
                             return;
                         }
                         hfRepos = lines(raw[0]);
@@ -847,7 +924,7 @@ private void showSettings() {
                         @Override
                         public void run() {
                             if (raw[0] != null && raw[0].startsWith("ERR:")) {
-                                toast(raw[0].substring(4).trim());
+                                toast(errMsg(raw[0]));
                                 return;
                             }
                             hfFileRepo = repo[0];
@@ -878,6 +955,8 @@ private void showSettings() {
                     @Override
                     public void onClick(View v) {
                         toast("ダウンロード中…: " + f[0]);
+                        progressSink = fv;
+                        progressSinkKey = "model";
                         final String[] res = new String[1];
                         runBg(new Runnable() {
                             @Override
@@ -1462,6 +1541,10 @@ private void showSettings() {
                 input.setText("");
                 send.setEnabled(false);
                 input.setHint("生成中…（端末内のモデルで考えています）");
+                streamBuf.setLength(0);
+                TextView bubble = text("", 15, ink, false, false);
+                thread.addView(bubble, matchWrap(12));
+                streamBubble = bubble;
                 final long nb = currentNb;
                 final String[] result = new String[1];
                 runBg(new Runnable() {
@@ -1472,8 +1555,9 @@ private void showSettings() {
                 }, new Runnable() {
                     @Override
                     public void run() {
+                        streamBubble = null;
                         if (result[0] != null && result[0].startsWith("ERR:")) {
-                            toast(result[0].substring(4).trim());
+                            toast(errMsg(result[0]));
                         }
                         showNotebook(currentNb, currentTitle, 1);
                     }
@@ -1717,7 +1801,7 @@ private void showSettings() {
                         go.setEnabled(true);
                         results.removeAllViews();
                         if (raw[0] != null && raw[0].startsWith("ERR:")) {
-                            results.addView(text(raw[0].substring(4).trim(),
+                            results.addView(text(errMsg(raw[0]),
                                     14, sub, false, false));
                             return;
                         }
@@ -1845,7 +1929,7 @@ private void buildStudio(LinearLayout body) {
                                 genBtn.setEnabled(true);
                                 statusTv.setVisibility(View.GONE);
                                 if (res.startsWith("ERR:")) {
-                                    toast(res.substring(4).trim());
+                                    toast(errMsg(res));
                                 } else {
                                     toast("音声概要を生成しました");
                                 }
@@ -2279,6 +2363,8 @@ private View voiceSlotRow(final String letter, final org.json.JSONObject entry,
                     row.addView(rightTv, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
                 } else if (downloading) {
                     rightTv = text("ダウンロード中…", 12, sub, false, false);
+                    progressSink = rightTv;
+                    progressSinkKey = key;
                     row.addView(rightTv, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
                 } else {
                     rightTv = text("⬇", 18, ink, false, false);
@@ -2405,10 +2491,10 @@ private View voiceSlotRow(final String letter, final org.json.JSONObject entry,
                     @Override public void run() {
                         String consentRes = Bridge.recordVoiceConsent(key);
                         if (consentRes != null && consentRes.startsWith("ERR:")) {
-                            msg[0] = consentRes;
+                            msg[0] = errMsg(consentRes);
                         } else {
                             String dlRes = Bridge.downloadVoice(key);
-                            msg[0] = (dlRes != null && dlRes.startsWith("ERR:")) ? dlRes : "ダウンロードしました";
+                            msg[0] = (dlRes != null && dlRes.startsWith("ERR:")) ? errMsg(dlRes) : "ダウンロードしました";
                         }
                     }
                 }, new Runnable() {

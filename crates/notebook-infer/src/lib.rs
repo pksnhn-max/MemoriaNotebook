@@ -40,6 +40,14 @@ impl LlamaGenerator {
 
 impl Generator for LlamaGenerator {
     fn generate(&mut self, prompt: &str) -> CoreResult<String> {
+        self.generate_streaming(prompt, &mut |_| {})
+    }
+
+    fn generate_streaming(
+        &mut self,
+        prompt: &str,
+        on_piece: &mut dyn FnMut(&str),
+    ) -> CoreResult<String> {
         let vocab = self.model.vocab();
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(4096))
@@ -88,6 +96,7 @@ impl Generator for LlamaGenerator {
             let mut s = String::with_capacity(max);
             decoder.decode_to_string(&piece, &mut s, false);
             out.push_str(&s);
+            on_piece(&s);
             batch.clear();
             batch.add(tok, n_cur, &[0], true).map_err(cerr("batch add gen"))?;
             n_cur += 1;
@@ -98,6 +107,9 @@ impl Generator for LlamaGenerator {
         let mut tail = String::new();
         decoder.decode_to_string(&[], &mut tail, true);
         out.push_str(&tail);
+        if !tail.is_empty() {
+            on_piece(&tail);
+        }
         Ok(out.trim().to_string())
     }
 }

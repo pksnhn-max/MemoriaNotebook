@@ -235,6 +235,22 @@ pub trait Generator {
     /// プロンプトからテキストを生成する。
     /// エラー時は `CoreError` を返す。
     fn generate(&mut self, prompt: &str) -> CoreResult<String>;
+
+    /// 生成しながら、できた断片を `on_piece` へ順に渡す版。
+    /// 既定では `generate` を丸ごと実行し、全文を1断片として渡す
+    /// （逐次出力を持たない座はこのままでよい）。戻り値は
+    /// `generate` と同じ全文。
+    fn generate_streaming(
+        &mut self,
+        prompt: &str,
+        on_piece: &mut dyn FnMut(&str),
+    ) -> CoreResult<String> {
+        let text = self.generate(prompt)?;
+        if !text.is_empty() {
+            on_piece(&text);
+        }
+        Ok(text)
+    }
 }
 
 pub struct CoreState {
@@ -650,6 +666,16 @@ impl CoreState {
     }
 }
 
+/// One event from the streaming generation path (`ask_generate_with_sink`).
+pub enum StreamEvent {
+    /// A piece of the answer being generated. Provisional: the
+    /// citation gate has not judged this attempt yet.
+    Token(String),
+    /// Discard the provisional text: the gate is retrying with the
+    /// sterner prompt, or it refused the answer outright.
+    Reset,
+}
+
 /// Lock-split part 2 of ask: generation plus the citation gate, as a
 /// free function over the prepared prompts — no state lock is held
 /// while the generator runs.
@@ -657,12 +683,31 @@ pub fn ask_generate(
     prepared: &AskPrepared,
     generator: &mut dyn Generator,
 ) -> CoreResult<GeneratedAnswer> {
-    let mut generated_text = generator.generate(&prepared.prompt)?;
+    ask_generate_with_sink(prepared, generator, &mut |_| {})
+}
+
+/// `ask_generate` with a sink for the generated pieces, so a caller
+/// (the vessel) can show the answer as it forms. Streamed text is
+/// provisional until the gate has judged it: a `Reset` event means
+/// the pieces shown so far are discarded.
+pub fn ask_generate_with_sink(
+    prepared: &AskPrepared,
+    generator: &mut dyn Generator,
+    sink: &mut dyn FnMut(StreamEvent),
+) -> CoreResult<GeneratedAnswer> {
+    let mut generated_text = generator.generate_streaming(&prepared.prompt, &mut |piece| {
+        sink(StreamEvent::Token(piece.to_string()));
+    })?;
     let mut citations = parse_citations(&generated_text, &prepared.hits);
     if citations.is_empty() && !prepared.hits.is_empty() {
-        generated_text = generator.generate(&prepared.retry_prompt)?;
+        sink(StreamEvent::Reset);
+        generated_text =
+            generator.generate_streaming(&prepared.retry_prompt, &mut |piece| {
+                sink(StreamEvent::Token(piece.to_string()));
+            })?;
         citations = parse_citations(&generated_text, &prepared.hits);
         if citations.is_empty() {
+            sink(StreamEvent::Reset);
             generated_text = "資料にありません。".to_string();
         }
     }
