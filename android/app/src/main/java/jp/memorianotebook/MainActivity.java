@@ -228,18 +228,22 @@ public final class MainActivity extends Activity {
         int night = getResources().getConfiguration().uiMode
                 & Configuration.UI_MODE_NIGHT_MASK;
         dark = night == Configuration.UI_MODE_NIGHT_YES;
+        // Two colours only (ruled 2026-11-19): black and white.
+        // Light mode is dark mode inverted, token for token; the
+        // grey steps are gone, so secondary text and hairlines
+        // resolve to the ink colour and surfaces to the ground.
         if (dark) {
-            ground = Color.rgb(0x13, 0x13, 0x12);
-            surface = Color.rgb(0x1E, 0x1E, 0x1C);
-            ink = Color.rgb(0xF2, 0xF2, 0xED);
-            sub = Color.rgb(0x9A, 0x9A, 0x94);
-            hairline = Color.rgb(0x2E, 0x2E, 0x2B);
+            ground = Color.BLACK;
+            surface = Color.BLACK;
+            ink = Color.WHITE;
+            sub = Color.WHITE;
+            hairline = Color.WHITE;
         } else {
-            ground = Color.rgb(0xF7, 0xF7, 0xF2);
-            surface = Color.rgb(0xFF, 0xFF, 0xFE);
-            ink = Color.rgb(0x1A, 0x1A, 0x18);
-            sub = Color.rgb(0x6E, 0x6E, 0x68);
-            hairline = Color.rgb(0xE2, 0xE2, 0xDC);
+            ground = Color.WHITE;
+            surface = Color.WHITE;
+            ink = Color.BLACK;
+            sub = Color.BLACK;
+            hairline = Color.BLACK;
         }
 
         screen = column();
@@ -404,9 +408,9 @@ public final class MainActivity extends Activity {
     private Button pillBtn(String label) {
         Button b = new Button(this);
         b.setText(label);
-        b.setTextColor(ink);
+        b.setTextColor(ground);
         GradientDrawable g = new GradientDrawable();
-        g.setColor(hairline);
+        g.setColor(ink);
         g.setCornerRadius(dp(20));
         b.setBackground(g);
         b.setPadding(dp(16), 0, dp(16), 0);
@@ -1245,11 +1249,11 @@ private void showSettings() {
         for (int i = 0; i < labels.length; i++) {
             final int idx = i;
             TextView tv = text(labels[i], 13,
-                    i == currentTab ? ink : sub, false, i == currentTab);
+                    i == currentTab ? ground : sub, false, i == currentTab);
             tv.setGravity(Gravity.CENTER);
             if (i == currentTab) {
                 GradientDrawable pill = new GradientDrawable();
-                pill.setColor(hairline);
+                pill.setColor(ink);
                 pill.setCornerRadius(dp(16));
                 tv.setBackground(pill);
             }
@@ -1284,7 +1288,7 @@ private void showSettings() {
             TextPaint p = new TextPaint(src);
             p.setTextSize(getResources().getDisplayMetrics().scaledDensity * 10.5f);
             p.setTypeface(Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD));
-            p.setColor(sub);
+            p.setColor(ground);
             return p;
         }
 
@@ -1313,7 +1317,7 @@ private void showSettings() {
             RectF rect = new RectF(x + dp(1), y - dp(15),
                     x + dp(1) + w, y + dp(3));
             Paint bg = new Paint(Paint.ANTI_ALIAS_FLAG);
-            bg.setColor(hairline);
+            bg.setColor(ink);
             bg.setStyle(Paint.Style.FILL);
             canvas.drawRoundRect(rect, dp(5), dp(5), bg);
             TextPaint p = chipPaint(paint);
@@ -1398,9 +1402,9 @@ private void showSettings() {
         row.setOrientation(LinearLayout.HORIZONTAL);
         for (int i = 0; i < citeIds.size(); i++) {
             final long chunkId = citeIds.get(i);
-            TextView chip = text(String.valueOf(i + 1), 12, sub, false, true);
+            TextView chip = text(String.valueOf(i + 1), 12, ground, false, true);
             GradientDrawable bg = new GradientDrawable();
-            bg.setColor(hairline);
+            bg.setColor(ink);
             bg.setCornerRadius(dp(5));
             chip.setBackground(bg);
             chip.setPadding(dp(8), dp(2), dp(8), dp(2));
@@ -1457,9 +1461,9 @@ private void showSettings() {
             if (user) {
                 LinearLayout row = new LinearLayout(this);
                 row.setGravity(Gravity.END);
-                TextView bubble = text(bodyText, 15, ink, false, false);
+                TextView bubble = text(bodyText, 15, ground, false, false);
                 GradientDrawable bg = new GradientDrawable();
-                bg.setColor(hairline);
+                bg.setColor(ink);
                 bg.setCornerRadius(dp(14));
                 bubble.setBackground(bg);
                 bubble.setPadding(dp(12), dp(8), dp(12), dp(8));

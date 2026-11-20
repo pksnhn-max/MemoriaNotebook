@@ -33,7 +33,7 @@ impl LlamaGenerator {
             backend,
             model,
             model_path,
-            max_tokens: 512,
+            max_tokens: 256,
         })
     }
 }
@@ -52,7 +52,7 @@ impl Generator for LlamaGenerator {
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(4096))
             .with_n_threads(4)
-            .with_n_threads_batch(4);
+            .with_n_threads_batch(8);
         let mut ctx = self
             .model
             .new_context(&self.backend, ctx_params)
