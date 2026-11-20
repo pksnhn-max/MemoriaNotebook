@@ -33,6 +33,22 @@ export CMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cma
 export ANDROID_ABI="arm64-v8a"
 export ANDROID_PLATFORM="android-26"
 
+# llama.cpp / ggml must target the cores the devices actually have:
+# armv8.2-a+dotprod unlocks the SDOT path for quantized GEMM/GEMV
+# (pre-fill and decode). Left alone, the build lands on plain
+# armv8-a, which measured as minutes-long waits on the POCO Pad
+# (Snapdragon 7s Gen 2: Cortex-A78/A55, both dotprod-capable).
+# CFLAGS do not survive the cargo-ndk/cc layers (measured: the
+# CMake cache kept armv8-a and the .so held zero SDOT), but
+# llama-cpp-sys-2's build script forwards GGML_* environment
+# variables to CMake as cache definitions. NOTE: the build
+# script sets always_configure(false), so if a stale CMake
+# build dir (out/build holding an old CMakeCache.txt) exists,
+# cmake-rs skips the configure step and this define never
+# lands — purge target/.../build/llama-cpp-sys-2/*/out/build
+# once before building with a changed value.
+export GGML_CPU_ARM_ARCH="armv8.2-a+dotprod"
+
 # 1. Rust .so for arm64 (cargo-ndk 4.x: platform flag is -P).
 cd "$ROOT"
 cargo ndk -t arm64-v8a -P 26 build --release -p notebook-app --offline
