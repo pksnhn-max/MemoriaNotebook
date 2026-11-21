@@ -7,3 +7,6 @@ edition = "2021"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 quick-xml = "0.38"
 encoding_rs = "0.8"
+
+[dev-dependencies]
+proptest = "1.12"

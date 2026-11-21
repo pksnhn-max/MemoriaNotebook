@@ -551,6 +551,9 @@ pub fn concat_wavs(wavs: &[Vec<u8>], gap_ms: u32) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(test)]
+mod oracle;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

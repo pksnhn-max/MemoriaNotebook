@@ -439,6 +439,15 @@ pub fn models_dir(data_dir: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
+mod oracle;
+#[cfg(test)]
+mod diff_tests;
+#[cfg(test)]
+mod prop_tests;
+#[cfg(test)]
+mod props_not_holding;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

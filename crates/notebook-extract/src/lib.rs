@@ -407,6 +407,17 @@ fn xhtml_to_text(xml: &[u8]) -> String {
 }
 
 #[cfg(test)]
+mod oracle;
+#[cfg(test)]
+mod diff_tests;
+#[cfg(test)]
+mod prop_tests;
+#[cfg(test)]
+mod fixture_tests;
+#[cfg(test)]
+mod props_not_holding;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;

@@ -1,0 +1,10 @@
+# GENERATED source-replacement config for the vendored notebook-core closure (vendor/).
+# NOT ACTIVE at the workspace root: activating it breaks resolution of the other
+# five members (their crates are not in this partial vendor tree). Kept as the
+# reference for the day the 5 cache-missing crates become obtainable and a full
+# workspace vendor can be generated. See the groundwork record for details.
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"

@@ -29,6 +29,9 @@ use std::path::{Path, PathBuf};
 
 pub mod voice;
 
+#[cfg(test)]
+mod props_internal;
+
 /// Which seat generates chat replies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -967,6 +970,9 @@ pub fn parse_citations(text: &str, hits: &[(ChunkRec, f32)]) -> Vec<Citation> {
     }
     citations
 }
+
+#[cfg(test)]
+mod oracle;
 
 #[cfg(test)]
 mod tests {
