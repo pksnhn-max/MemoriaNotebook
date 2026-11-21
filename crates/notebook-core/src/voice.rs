@@ -486,6 +486,22 @@ fn parse_wav_header(data: &[u8]) -> Result<(WavHeader, usize), String> {
         return Err("data chunk not found".to_string());
     }
 
+    // Geometry bounds, enforced at the parse boundary before any
+    // downstream arithmetic forms products from these fields
+    // (byte_rate, block_align, gap silence). The ranges are the
+    // dr_wav / Symphonia shape: bits must be a real PCM depth,
+    // channels and sample rate stay inside what real audio uses,
+    // so the downstream products provably fit their header fields.
+    if !matches!(header.bits_per_sample, 8 | 16 | 24 | 32) {
+        return Err("unsupported bits per sample".to_string());
+    }
+    if !(1..=256).contains(&header.num_channels) {
+        return Err("channel count out of range".to_string());
+    }
+    if !(1..=384_000).contains(&header.sample_rate) {
+        return Err("sample rate out of range".to_string());
+    }
+
     Ok((header, data_offset))
 }
 
@@ -504,9 +520,18 @@ pub fn concat_wavs(wavs: &[Vec<u8>], gap_ms: u32) -> Result<Vec<u8>, String> {
     }
 
     let mut all_pcm = Vec::new();
-    let bytes_per_sample = (bits_per_sample / 8) as usize;
-    let gap_samples = (sample_rate as u64 * gap_ms as u64 / 1000) as usize;
-    let gap_bytes = gap_samples * num_channels as usize * bytes_per_sample;
+    // Intermediates are u64 (the geometry is already bounded by
+    // parse_wav_header, so these products cannot overflow u64 for
+    // any header-derived factor; gap_ms is the caller's, so the
+    // running total is checked against the format's own limit
+    // below before anything is allocated).
+    let bytes_per_sample = (bits_per_sample / 8) as u64;
+    let gap_samples = sample_rate as u64 * gap_ms as u64 / 1000;
+    let gap_bytes = gap_samples * num_channels as u64 * bytes_per_sample;
+    // The output header stores riff_size = 36 + data_size in u32
+    // fields, so a larger total is unrepresentable in the format.
+    const MAX_DATA_SIZE: u64 = u32::MAX as u64 - 36;
+    let mut total_bytes: u64 = 0;
 
     for (i, wav) in wavs.iter().enumerate() {
         let (header, data_offset) = parse_wav_header(wav)?;
@@ -519,10 +544,18 @@ pub fn concat_wavs(wavs: &[Vec<u8>], gap_ms: u32) -> Result<Vec<u8>, String> {
         }
 
         let pcm_data = &wav[data_offset..data_offset + header.data_size as usize];
+        total_bytes += pcm_data.len() as u64;
+        if total_bytes > MAX_DATA_SIZE {
+            return Err("concatenated wav too large".to_string());
+        }
         all_pcm.extend_from_slice(pcm_data);
 
         if i + 1 < wavs.len() && gap_bytes > 0 {
-            all_pcm.extend(std::iter::repeat(0u8).take(gap_bytes));
+            total_bytes += gap_bytes;
+            if total_bytes > MAX_DATA_SIZE {
+                return Err("concatenated wav too large".to_string());
+            }
+            all_pcm.extend(std::iter::repeat(0u8).take(gap_bytes as usize));
         }
     }
 
@@ -538,10 +571,13 @@ pub fn concat_wavs(wavs: &[Vec<u8>], gap_ms: u32) -> Result<Vec<u8>, String> {
     out.extend_from_slice(&1u16.to_le_bytes());
     out.extend_from_slice(&num_channels.to_le_bytes());
     out.extend_from_slice(&sample_rate.to_le_bytes());
-    let byte_rate = sample_rate * num_channels as u32 * bytes_per_sample as u32;
-    out.extend_from_slice(&byte_rate.to_le_bytes());
-    let block_align = num_channels * bytes_per_sample as u16;
-    out.extend_from_slice(&block_align.to_le_bytes());
+    // Formed in u64; the casts are lossless because parse
+    // validation bounds the geometry (byte_rate <= 384_000 * 256
+    // * 4, block_align <= 256 * 4).
+    let byte_rate = sample_rate as u64 * num_channels as u64 * bytes_per_sample;
+    out.extend_from_slice(&(byte_rate as u32).to_le_bytes());
+    let block_align = num_channels as u64 * bytes_per_sample;
+    out.extend_from_slice(&(block_align as u16).to_le_bytes());
     out.extend_from_slice(&bits_per_sample.to_le_bytes());
     out.extend_from_slice(b"data");
     out.extend_from_slice(&data_size.to_le_bytes());
@@ -825,8 +861,20 @@ pub fn remove_summary(data_dir: &Path, id: u64) -> Result<Option<AudioSummary>, 
 
 pub fn wav_duration_sec(wav: &[u8]) -> Option<f64> {
     let (header, _) = parse_wav_header(wav).ok()?;
-    let bytes_per_sample = (header.bits_per_sample / 8) as u32;
-    let bytes_per_sec = header.sample_rate * (header.num_channels as u32) * bytes_per_sample;
+    // Duration is data_length / block_align / sample_rate (frames
+    // over rate). The denominator is formed in u64 from geometry
+    // that parse validation has already bounded (block_align
+    // <= 256 * 4, sample_rate <= 384_000), so it cannot overflow —
+    // unlike the old u32 product here — and is computed from the
+    // geometry, never read from the stored byte-rate field. One
+    // final division keeps the result the correctly rounded value
+    // of the quotient, bit-identical to the pre-fix result on
+    // every input the old code could handle (a two-step f64
+    // division double-rounds and breaks that identity on
+    // non-frame-aligned data sizes; pinned by the differential
+    // property against the frozen oracle).
+    let block_align = header.num_channels as u64 * (header.bits_per_sample / 8) as u64;
+    let bytes_per_sec = block_align * header.sample_rate as u64;
     if bytes_per_sec == 0 {
         return None;
     }

@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 8b371aac67e782eb5af7091e577c8757eb9b219620f75796bea13d16c05c998a # shrinks to valids = [Notebook { id: 0, title: "", created_at: 0, updated_at: 0 }], bad = [[128]], pos = 0
+cc f449725173dcc3c9c4683cf1b8b39dd07d72e7594ebe351d117fbb17c11764fa # shrinks to valids = [Notebook { id: 0, title: "", created_at: 0, updated_at: 0 }], bad = [[194, 160]], pos = 0

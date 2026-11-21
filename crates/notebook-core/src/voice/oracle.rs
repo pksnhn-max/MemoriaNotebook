@@ -507,15 +507,34 @@ mod diff_tests {
         ]
     }
 
+    /// The geometry ranges live `parse_wav_header` accepts after
+    /// the FA fix (2026-11-21): the parse boundary validates, the
+    /// frozen oracle does not. Used to carve the intended
+    /// difference out of the two properties below.
+    fn geometry_in_range(sample_rate: u32, num_channels: u16, bits_per_sample: u16) -> bool {
+        (1..=384_000).contains(&sample_rate)
+            && (1..=256).contains(&num_channels)
+            && matches!(bits_per_sample, 8 | 16 | 24 | 32)
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(1000))]
 
         #[test]
         fn parse_wav_header_matches_oracle(wav in wav_strategy()) {
-            prop_assert_eq!(
-                proj_live(live_parse_wav_header(&wav)),
-                proj_oracle(oracle_parse_wav_header(&wav))
-            );
+            let oracle = proj_oracle(oracle_parse_wav_header(&wav));
+            let live = proj_live(live_parse_wav_header(&wav));
+            match &oracle {
+                // Intended difference (FA fix): the oracle accepts
+                // this geometry, live rejects it at the parse
+                // boundary. Yardstick item — see the FA record
+                // book, 「物差し項目（要人間検め）」.
+                Ok((rate, ch, bits, _, _)) if !geometry_in_range(*rate, *ch, *bits) => {
+                    prop_assert!(live.is_err(),
+                        "live must reject out-of-range geometry, got {live:?}");
+                }
+                _ => prop_assert_eq!(live, oracle),
+            }
         }
 
         #[test]
@@ -523,7 +542,22 @@ mod diff_tests {
             wavs in prop::collection::vec(concat_wav_strategy(), 0..3),
             gap in prop_oneof![Just(0u32), Just(1), Just(350), (0u32..5000)],
         ) {
-            prop_assert_eq!(live_concat_wavs(&wavs, gap), oracle_concat_wavs(&wavs, gap));
+            // Intended difference (FA fix): if any input's geometry
+            // is outside the validated ranges, live rejects at
+            // parse (an Err whose message differs from the oracle's
+            // downstream checks); otherwise both sides must agree
+            // exactly, bytes and error messages included.
+            // Yardstick item — see the FA record book,
+            // 「物差し項目（要人間検め）」.
+            let any_out_of_range = wavs.iter().any(|w| {
+                matches!(oracle_parse_wav_header(w),
+                    Ok((h, _)) if !geometry_in_range(h.sample_rate, h.num_channels, h.bits_per_sample))
+            });
+            if any_out_of_range {
+                prop_assert!(live_concat_wavs(&wavs, gap).is_err());
+            } else {
+                prop_assert_eq!(live_concat_wavs(&wavs, gap), oracle_concat_wavs(&wavs, gap));
+            }
         }
 
         #[test]
@@ -789,38 +823,41 @@ mod fixture_tests {
         }
     }
 
-    /// Finding pinned from the generated differential layer (proptest
-    /// regression seed cc 735c222e08f99009ccce6eb46618b328ab1b8917149f7772b6ac9bdc44506010,
-    /// 2026-11-21): the header below declares num_channels = 22017
-    /// and 24 bits/sample, so the output-header arithmetic of
-    /// `concat_wavs` overflows — block_align is the u16 product
-    /// 22017 × 3 = 66051 (live voice.rs:543; byte_rate at :541 is
-    /// the same class). In debug builds both sides panic; in release
-    /// both wrap and produce the same bytes. The generated
-    /// concat/duration properties use canonical format fields (see
-    /// `diff_tests::concat_wav_strategy`), so this wild-geometry
-    /// case is pinned here deterministically: live and oracle must
-    /// agree, including on panicking.
+    /// Intended difference, FA fix (2026-11-21) — yardstick item,
+    /// proposed here and recorded for human inspection in the FA
+    /// record book, 「物差し項目（要人間検め）」.
+    ///
+    /// The header below (pinned from proptest regression seed
+    /// cc 735c222e08f99009ccce6eb46618b328ab1b8917149f7772b6ac9bdc44506010)
+    /// declares num_channels = 22017 and 24 bits/sample.
+    /// Old agreed behavior (the frozen oracle, verbatim): the
+    /// output-header arithmetic of `concat_wavs` overflows —
+    /// block_align is the u16 product 22017 × 3 = 66051 — so debug
+    /// builds panic and release builds wrap and emit bytes;
+    /// duration returns Some(64 / (24000 × 22017 × 3)).
+    /// New live behavior: `parse_wav_header` validates geometry at
+    /// the parse boundary (num_channels must be 1..=256), so
+    /// concat is a clean Err and duration is None — no panic.
     #[test]
-    fn wild_format_geometry_live_and_oracle_agree() {
+    fn wild_format_geometry_live_rejects_intended_difference() {
         let mut wav: Vec<u8> = vec![
             82, 73, 70, 70, 100, 0, 0, 0, 87, 65, 86, 69, 102, 109, 116, 32, 16, 0, 0, 0, 1, 0,
             1, 86, 192, 93, 0, 0, 64, 25, 1, 0, 3, 0, 24, 0, 100, 97, 116, 97, 64, 0, 0, 0,
         ];
         wav.extend(std::iter::repeat(0u8).take(64));
-        let live = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            live_concat_wavs(&[wav.clone()], 0)
-        }));
-        let oracle = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Live: rejected at the parse boundary, no panic.
+        assert!(live_concat_wavs(&[wav.clone()], 0).is_err());
+        assert_eq!(live_wav_duration_sec(&wav), None);
+        // Oracle (frozen old code): never returns a clean Err on
+        // this input — it panics in debug builds and wraps through
+        // to Ok(bytes) in release builds; duration still computes.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             oracle_concat_wavs(&[wav.clone()], 0)
-        }));
-        match (live, oracle) {
-            (Ok(a), Ok(b)) => assert_eq!(a, b),
-            (Err(_), Err(_)) => {}
-            _ => panic!("live and oracle disagree on wild format geometry"),
+        })) {
+            Ok(Ok(_)) => {} // release: wrapped arithmetic, bytes out
+            Ok(Err(e)) => panic!("oracle unexpectedly returned a clean Err: {e}"),
+            Err(_) => {} // debug: arithmetic-overflow panic
         }
-        // Duration does not panic on this input (its u32 byte-rate
-        // product 24000 × 22017 × 3 fits) and must agree exactly.
-        assert_eq!(live_wav_duration_sec(&wav), oracle_wav_duration_sec(&wav));
+        assert_eq!(oracle_wav_duration_sec(&wav), Some(64.0 / 1_585_224_000.0));
     }
 }

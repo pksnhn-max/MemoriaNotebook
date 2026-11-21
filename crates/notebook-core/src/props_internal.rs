@@ -6,12 +6,19 @@
 //!
 //! Every generated property runs at 1,000 cases (brief contract).
 //!
-//! One test is the annex's claim taken literally and is EXPECTED TO
-//! FAIL on the current implementation; it is kept failing, not
-//! ignored and not weakened (brief contract — the supervisor
-//! collates). See the W1 record book
-//! (~/workspace/notebook-design/records/2026-11-21-w1-core-props.md):
-//!   - `read_jsonl_skips_invalid_utf8_lines` (candidate 2-1)
+//! History: `read_jsonl_skips_invalid_utf8_lines` (candidate 2-1)
+//! was the annex's claim kept failing against the old
+//! `BufReader::lines` implementation; brief FB (2026-11-21) changed
+//! the implementation to per-line isolation with a skip count, and
+//! the test now asserts the standing contract (regression flip —
+//! see the FB record book
+//! ~/workspace/notebook-design/records/2026-11-21-fb-core-fix.md).
+//! Continuation FB2 (same day): the merged run found the test's
+//! own generator leaking its contract — byte strings that decode
+//! to a whitespace-only string (e.g. [0xC2, 0xA0] = U+00A0) are
+//! blank lines under the contract, not damaged lines. The
+//! generator now states and enforces that contract (see
+//! `bad_line`); the implementation was not changed.
 
 use super::*;
 use proptest::prelude::*;
@@ -148,7 +155,9 @@ where
     for r in recs {
         append_jsonl(path, r).unwrap();
     }
-    read_jsonl(path).unwrap()
+    let out = read_jsonl(path).unwrap();
+    assert_eq!(out.skipped, 0, "a clean round trip skips nothing");
+    out.records
 }
 
 proptest! {
@@ -241,13 +250,36 @@ fn line_strategy() -> impl Strategy<Value = Line> {
     ]
 }
 
+/// One damaged line for the invalid-UTF-8 leg, as raw bytes over
+/// 0x80..=0xFF. Contract, stated at face value: a generated line is
+/// a line the reader counts as damaged exactly once — either it is
+/// not valid UTF-8 at all (counted at the UTF-8 gate), or it
+/// decodes to text with non-whitespace content, which contains no
+/// ASCII structure and so fails JSON parsing (counted there).
+/// Byte strings that decode to a whitespace-only string (e.g.
+/// [0xC2, 0xA0] = U+00A0, a NO-BREAK SPACE) are NOT damaged lines:
+/// under the standing contract (brief FB decision 1) a
+/// whitespace-only line is a blank line, skipped silently and
+/// never counted. The filter excludes exactly that class, by the
+/// contract's own criterion (`str::trim`).
+fn bad_line() -> impl Strategy<Value = Vec<u8>> {
+    prop::collection::vec(0x80u8..=0xFF, 1..=6).prop_filter(
+        "whitespace-only decodings are blank lines, not damaged lines",
+        |b| match std::str::from_utf8(b) {
+            Ok(s) => !s.trim().is_empty(),
+            Err(_) => true,
+        },
+    )
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(1000))]
 
     /// Candidate 2-1, UTF-8 leg: corrupt lines that are still valid
     /// UTF-8 (broken JSON, wrong shape, blank) are skipped, and
     /// every valid record around them is read, in order, with no
-    /// panic and no early stop.
+    /// panic and no early stop. The skip signal counts exactly the
+    /// non-blank corrupt lines (blank lines are not damage).
     #[test]
     fn read_jsonl_skips_utf8_valid_corrupt_lines(
         lines in prop::collection::vec(line_strategy(), 0..=16)
@@ -256,35 +288,42 @@ proptest! {
         let path = dir.path().join("mixed.jsonl");
         let mut content = String::new();
         let mut expected: Vec<Notebook> = Vec::new();
+        let mut expected_skipped = 0usize;
         for l in &lines {
             match l {
                 Line::Valid(nb) => {
                     content.push_str(&serde_json::to_string(nb).unwrap());
                     expected.push(nb.clone());
                 }
-                Line::Corrupt(s) => content.push_str(s),
+                Line::Corrupt(s) => {
+                    if !s.trim().is_empty() {
+                        expected_skipped += 1;
+                    }
+                    content.push_str(s)
+                }
             }
             content.push('\n');
         }
         std::fs::write(&path, content).unwrap();
-        let got: Vec<Notebook> = read_jsonl(&path).unwrap();
-        prop_assert_eq!(got, expected);
+        let got = read_jsonl::<Notebook>(&path).unwrap();
+        prop_assert_eq!(&got.records, &expected);
+        prop_assert_eq!(got.skipped, expected_skipped);
     }
 
-    /// Candidate 2-1 AS WRITTEN IN THE ANNEX, with invalid-UTF-8
-    /// lines mixed into the file. Expected to FAIL on the current
-    /// implementation: `BufReader::lines()` yields an io error on
-    /// invalid UTF-8 and `read_jsonl` propagates it instead of
-    /// skipping the line. Kept literal per the brief contract; see
-    /// the W1 record book.
+    /// Candidate 2-1, invalid-UTF-8 leg: lines of raw high bytes
+    /// mixed into the file are isolated — every valid record around
+    /// them is read, the read does not fail, and the skip signal
+    /// counts exactly the injected bad lines. (Each bad line is
+    /// counted exactly once: as invalid UTF-8, or — for the byte
+    /// patterns that happen to be valid UTF-8 — as unparseable
+    /// JSON, since it contains no ASCII structure. Byte patterns
+    /// that decode to whitespace only are blank lines under the
+    /// contract, not bad lines; `bad_line` states and enforces
+    /// that boundary.)
     #[test]
-    #[ignore = "現行不成立（annex額面）: 不正UTF-8行でread_jsonlがErrを伝播し全体が読めない（BufRead::linesの文書化された契約通り）。廃止条件: 行単位スキップの実装になるか、annex額面がstd契約読みへ訂正される事。詳細はW1記録帳"]
     fn read_jsonl_skips_invalid_utf8_lines(
         valids in prop::collection::vec(arb_notebook(), 1..=6),
-        bad in prop::collection::vec(
-            prop::collection::vec(0x80u8..=0xFF, 1..=6),
-            1..=3
-        ),
+        bad in prop::collection::vec(bad_line(), 1..=3),
         pos in 0..=6usize,
     ) {
         let dir = TempDir::new("i21b");
@@ -303,13 +342,9 @@ proptest! {
             bytes.push(b'\n');
         }
         std::fs::write(&path, bytes).unwrap();
-        let got: CoreResult<Vec<Notebook>> = read_jsonl(&path);
-        prop_assert!(
-            got.is_ok(),
-            "read_jsonl errored on an invalid-UTF-8 line: {:?}",
-            got.err()
-        );
-        prop_assert_eq!(got.unwrap(), valids);
+        let got = read_jsonl::<Notebook>(&path).unwrap();
+        prop_assert_eq!(&got.records, &valids);
+        prop_assert_eq!(got.skipped, bad.len());
     }
 }
 

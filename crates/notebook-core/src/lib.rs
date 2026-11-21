@@ -269,6 +269,16 @@ pub struct CoreState {
     /// Embedding vectors for chunks that have been indexed.
     /// chunk_id -> vector (f32)
     embeddings: HashMap<u64, Vec<f32>>,
+    /// Hash of the chunk text each stored embedding was computed
+    /// from (chunk_id -> text hash), as recorded in v2 sidecar
+    /// records. The re-embedding gate compares this against the
+    /// current text's hash. A chunk with an embedding but no entry
+    /// here holds a v1 (hashless) record and counts as stale.
+    emb_hashes: HashMap<u64, u64>,
+    /// Text hashes of the chunks the latest `index_prepare` handed
+    /// out, waiting for `index_commit` to move them into
+    /// `emb_hashes` for the pairs that were actually embedded.
+    pending_hashes: HashMap<u64, u64>,
     next_notebook_id: u64,
     next_source_id: u64,
     next_chunk_id: u64,
@@ -282,19 +292,19 @@ impl CoreState {
         local_model_display_name: &str,
     ) -> CoreResult<Self> {
         fs::create_dir_all(data_dir)?;
-        let all_notebooks: Vec<Notebook> = read_jsonl(&data_dir.join("notebooks.jsonl"))?;
+        let all_notebooks: Vec<Notebook> = read_jsonl(&data_dir.join("notebooks.jsonl"))?.records;
         // The id counter runs over ALL notebooks ever created,
         // including deleted ones, so ids are never reused.
         let next_notebook_id = all_notebooks.iter().map(|n| n.id).max().unwrap_or(0) + 1;
         // Tombstones: ids in deleted.jsonl are dropped from the live
         // list (the records themselves stay in their files).
-        let deleted: Vec<u64> = read_jsonl(&data_dir.join("deleted.jsonl"))?;
+        let deleted: Vec<u64> = read_jsonl(&data_dir.join("deleted.jsonl"))?.records;
         let notebooks: Vec<Notebook> = all_notebooks
             .into_iter()
             .filter(|n| !deleted.contains(&n.id))
             .collect();
-        let sources: Vec<SourceRec> = read_jsonl(&data_dir.join("sources.jsonl"))?;
-        let all_chunks: Vec<ChunkRec> = read_jsonl(&data_dir.join("chunks.jsonl"))?;
+        let sources: Vec<SourceRec> = read_jsonl(&data_dir.join("sources.jsonl"))?.records;
+        let all_chunks: Vec<ChunkRec> = read_jsonl(&data_dir.join("chunks.jsonl"))?.records;
         let next_source_id = sources.iter().map(|s| s.id).max().unwrap_or(0) + 1;
         let next_chunk_id = all_chunks.iter().map(|c| c.id).max().unwrap_or(0) + 1;
         // Keep only the newest revision per source.
@@ -310,6 +320,7 @@ impl CoreState {
 
         // Load embedding sidecar.
         let embeddings = load_embeddings(&data_dir.join("emb_chunks.bin"), &chunks)?;
+        let emb_hashes = load_embedding_hashes(&data_dir.join("emb_chunks.bin"), &chunks)?;
 
         Ok(CoreState {
             data_dir: data_dir.to_path_buf(),
@@ -320,6 +331,8 @@ impl CoreState {
             chunks,
             chunk_rev,
             embeddings,
+            emb_hashes,
+            pending_hashes: HashMap::new(),
             next_notebook_id,
             next_source_id,
             next_chunk_id,
@@ -433,6 +446,8 @@ impl CoreState {
             .collect();
         for id in old_chunk_ids {
             self.embeddings.remove(&id);
+            self.emb_hashes.remove(&id);
+            self.pending_hashes.remove(&id);
         }
         self.chunks.retain(|c| c.source_id != source_id);
         self.chunks.extend(made.iter().cloned());
@@ -477,32 +492,56 @@ impl CoreState {
         v
     }
 
-    /// Lock-split part 1 of indexing: existence check and the chunk
-    /// list, taken out of the state so the embedding itself can run
-    /// without the state lock (see `embed_chunks` / `index_commit`).
+    /// Lock-split part 1 of indexing: existence check and the list
+    /// of chunks that still need (re)embedding, taken out of the
+    /// state so the embedding itself can run without the state lock
+    /// (see `embed_chunks` / `index_commit`). The hash gate sits
+    /// here, before the embedder is ever called: a chunk whose
+    /// stored embedding was computed from the current text (its
+    /// recorded text hash matches) is not handed out again; a chunk
+    /// with no embedding, a changed text, or only a hashless v1
+    /// record is.
     pub fn index_prepare(&mut self, source_id: u64) -> CoreResult<Vec<(u64, String)>> {
         if !self.sources.iter().any(|s| s.id == source_id) {
             return Err(CoreError::SourceNotFound(source_id));
         }
-        let chunks: Vec<(u64, String)> = self
+        let all: Vec<(u64, String)> = self
             .chunks_of(source_id)
             .into_iter()
             .map(|c| (c.id, c.text.clone()))
             .collect();
-        Ok(chunks)
+        let mut todo = Vec::new();
+        for (chunk_id, text) in all {
+            let h = text_hash(&text);
+            if self.embeddings.contains_key(&chunk_id)
+                && self.emb_hashes.get(&chunk_id) == Some(&h)
+            {
+                // Already embedded from exactly this text.
+                continue;
+            }
+            self.pending_hashes.insert(chunk_id, h);
+            todo.push((chunk_id, text));
+        }
+        Ok(todo)
     }
 
     /// Lock-split part 3 of indexing: merge the pairs embedded outside
-    /// the lock into the in-memory embedding map.
+    /// the lock into the in-memory embedding map, recording each
+    /// committed chunk's text hash for the gate.
     pub fn index_commit(&mut self, pairs: Vec<(u64, Vec<f32>)>) {
         for (chunk_id, vec) in pairs {
+            if let Some(h) = self.pending_hashes.remove(&chunk_id) {
+                self.emb_hashes.insert(chunk_id, h);
+            }
             self.embeddings.insert(chunk_id, vec);
         }
     }
 
-    /// Embed all current chunks of `source_id` using `embedder`, append
-    /// vectors to the sidecar, and keep them in memory. Returns the
-    /// number of chunks embedded.
+    /// Embed the current chunks of `source_id` that need it (see
+    /// `index_prepare`'s hash gate) using `embedder`, append vectors
+    /// to the sidecar, and keep them in memory. Returns the number
+    /// of chunks embedded by this call — 0 when everything current
+    /// was already embedded from the same text.
     pub fn index_source(
         &mut self,
         source_id: u64,
@@ -563,7 +602,7 @@ impl CoreState {
     }
 
     pub fn turns_of(&self, nb: u64) -> CoreResult<Vec<ChatTurn>> {
-        let all: Vec<ChatTurn> = read_jsonl(&self.data_dir.join("turns.jsonl"))?;
+        let all: Vec<ChatTurn> = read_jsonl(&self.data_dir.join("turns.jsonl"))?.records;
         Ok(all.into_iter().filter(|t| t.nb == nb).collect())
     }
 
@@ -720,9 +759,35 @@ pub fn ask_generate_with_sink(
     })
 }
 
+/// Flag bit in a sidecar record's `dim` word: the record carries a
+/// chunk-text hash (u64 LE) between the dim word and the vector
+/// (format v2). Records written before the hash gate have the bit
+/// clear and no hash field; readers accept both, and a hashless
+/// record counts as stale (its chunk is re-embedded once, then
+/// rewritten in v2 form). Real embedding dimensions are far below
+/// 2^31, so the bit is free.
+const EMB_HASH_FLAG: u32 = 0x8000_0000;
+
+/// Stable hash of a chunk's text, used as the re-embedding gate's
+/// key: a stored embedding is reused exactly when the hash of the
+/// text it was computed from equals the current text's hash.
+/// FNV-1a (64-bit) — deterministic across runs and platforms,
+/// dependency-free, and sufficient for change detection (this is
+/// not a security boundary). `DefaultHasher` is not used: std does
+/// not guarantee its output is stable across executions.
+fn text_hash(text: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in text.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 /// Lock-split part 2 of indexing: embed `chunks` and append the
-/// vectors to `data_dir/emb_chunks.bin` (record: chunk_id u64 LE,
-/// dim u32 LE, f32[dim] LE; flush per record, sync_all at the end).
+/// vectors to `data_dir/emb_chunks.bin` (record v2: chunk_id u64 LE,
+/// dim u32 LE with `EMB_HASH_FLAG` set, text hash u64 LE,
+/// f32[dim] LE; flush per record, sync_all at the end).
 /// Returns the pairs that were written together with the outcome, so
 /// partial progress is preserved exactly as the unsplit code did: on
 /// an error the pairs written so far still come back for committing.
@@ -743,12 +808,16 @@ pub fn embed_chunks(
             Ok(v) => v,
             Err(e) => return (written, Err(e)),
         };
-        // Write record: chunk_id (u64 LE), dim (u32 LE), f32[dim] LE
+        // Write record: chunk_id (u64 LE), dim|FLAG (u32 LE),
+        // text hash (u64 LE), f32[dim] LE
         if let Err(e) = file.write_all(&chunk_id.to_le_bytes()) {
             return (written, Err(CoreError::Io(e)));
         }
         let dim = vec.len() as u32;
-        if let Err(e) = file.write_all(&dim.to_le_bytes()) {
+        if let Err(e) = file.write_all(&(dim | EMB_HASH_FLAG).to_le_bytes()) {
+            return (written, Err(CoreError::Io(e)));
+        }
+        if let Err(e) = file.write_all(&text_hash(&chunk_text).to_le_bytes()) {
             return (written, Err(CoreError::Io(e)));
         }
         for v in &vec {
@@ -771,10 +840,15 @@ pub fn embed_chunks(
 /// Target chunk size in characters (paragraph units, roughly 400).
 pub const CHUNK_TARGET_CHARS: usize = 400;
 
-/// Split text into chunks: paragraphs (blank-line separated) are packed
-/// in order into chunks of at most roughly `CHUNK_TARGET_CHARS`
-/// characters; a paragraph longer than twice the target is hard-split
-/// near the target, preferring a sentence end (`。` / `、`).
+/// Split text into chunks, aiming at `CHUNK_TARGET_CHARS`
+/// characters per chunk. Paragraphs (blank-line separated) are
+/// packed in order while they fit the target; a single paragraph
+/// that exceeds the target stays whole up to twice the target; a
+/// paragraph longer than twice the target is hard-split near the
+/// target, preferring a sentence end (`。` / `、`).
+/// Guarantees: no chunk exceeds `2 * CHUNK_TARGET_CHARS`
+/// characters, and hard-split pieces never exceed
+/// `CHUNK_TARGET_CHARS`.
 pub fn chunk_text(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
@@ -840,49 +914,104 @@ fn append_jsonl<T: Serialize>(path: &Path, rec: &T) -> CoreResult<()> {
     Ok(())
 }
 
-fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> CoreResult<Vec<T>> {
+/// Outcome of a `read_jsonl` pass: the records that parsed, plus
+/// the number of non-blank lines that were skipped because they
+/// could not be turned into a record (invalid UTF-8, or JSON that
+/// does not parse). The count is the caller's signal that the file
+/// held damaged lines — a damaged line is isolated and never fails
+/// the whole read.
+struct JsonlRead<T> {
+    records: Vec<T>,
+    skipped: usize,
+}
+
+fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> CoreResult<JsonlRead<T>> {
+    let mut out = Vec::new();
+    let mut skipped = 0usize;
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok(JsonlRead {
+            records: out,
+            skipped,
+        });
     }
     let f = fs::File::open(path)?;
-    let mut out = Vec::new();
-    for line in BufReader::new(f).lines() {
-        let line = line?;
-        if line.trim().is_empty() {
+    let mut reader = BufReader::new(f);
+    let mut raw: Vec<u8> = Vec::new();
+    loop {
+        raw.clear();
+        // Byte-wise line read: one line's bad bytes must not poison
+        // the lines around it (BufRead::lines would fail the whole
+        // iteration on the first invalid-UTF-8 line).
+        let n = reader.read_until(b'\n', &mut raw)?;
+        if n == 0 {
+            break;
+        }
+        let mut line = &raw[..];
+        if line.last() == Some(&b'\n') {
+            line = &line[..line.len() - 1];
+        }
+        if line.last() == Some(&b'\r') {
+            line = &line[..line.len() - 1];
+        }
+        if line.iter().all(|b| b.is_ascii_whitespace()) {
+            // Blank line: not a record, not damage; not counted.
             continue;
         }
-        match serde_json::from_str(&line) {
+        let text = match std::str::from_utf8(line) {
+            Ok(t) => t,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str(text) {
             Ok(record) => out.push(record),
             Err(_) => {
-                // Skip corrupted line, continue with next
-                continue;
+                // Skip corrupted line, continue with next; the skip
+                // is counted so the damage stays visible.
+                skipped += 1;
             }
         }
     }
-    Ok(out)
+    Ok(JsonlRead {
+        records: out,
+        skipped,
+    })
 }
 
-/// Load embeddings from the binary sidecar. Returns a map of chunk_id -> vector.
-/// Only keeps vectors for chunk_ids that exist in `current_chunks`.
-/// Stops reading at the first truncated/corrupted record.
-fn load_embeddings(
-    path: &Path,
-    current_chunks: &[ChunkRec],
-) -> CoreResult<HashMap<u64, Vec<f32>>> {
-    let mut map = HashMap::new();
-    if !path.exists() {
-        return Ok(map);
-    }
-    let mut file = fs::File::open(path)?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
+/// One parsed sidecar record: the chunk id, the text hash for v2
+/// records (`None` for hashless v1 records), and the vector.
+struct SidecarRecord {
+    chunk_id: u64,
+    text_hash: Option<u64>,
+    vec: Vec<f32>,
+}
+
+/// Walk the sidecar's records in file order, accepting both the v1
+/// layout (chunk_id, dim, f32[dim]) and the v2 layout (chunk_id,
+/// dim|EMB_HASH_FLAG, hash, f32[dim]). Stops at the first
+/// truncated/corrupted record, exactly as the original reader did.
+fn parse_sidecar(buf: &[u8]) -> Vec<SidecarRecord> {
+    let mut out = Vec::new();
     let mut pos = 0;
-    let valid_ids: std::collections::HashSet<u64> = current_chunks.iter().map(|c| c.id).collect();
     while pos + 8 + 4 <= buf.len() {
         let chunk_id = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
         pos += 8;
-        let dim = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        let dim_word = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap());
         pos += 4;
+        let dim = (dim_word & !EMB_HASH_FLAG) as usize;
+        let mut rec_hash = None;
+        if dim_word & EMB_HASH_FLAG != 0 {
+            if pos + 8 > buf.len() {
+                // Truncated record; stop here.
+                break;
+            }
+            rec_hash = Some(u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap()));
+            pos += 8;
+        }
         if pos + dim * 4 > buf.len() {
             // Truncated record; stop here.
             break;
@@ -893,8 +1022,59 @@ fn load_embeddings(
             pos += 4;
             vec.push(v);
         }
-        if valid_ids.contains(&chunk_id) {
-            map.insert(chunk_id, vec);
+        out.push(SidecarRecord {
+            chunk_id,
+            text_hash: rec_hash,
+            vec,
+        });
+    }
+    out
+}
+
+fn read_sidecar(path: &Path) -> CoreResult<Vec<SidecarRecord>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let mut file = fs::File::open(path)?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    Ok(parse_sidecar(&buf))
+}
+
+/// Load embeddings from the binary sidecar. Returns a map of chunk_id -> vector.
+/// Only keeps vectors for chunk_ids that exist in `current_chunks`.
+/// Stops reading at the first truncated/corrupted record.
+fn load_embeddings(
+    path: &Path,
+    current_chunks: &[ChunkRec],
+) -> CoreResult<HashMap<u64, Vec<f32>>> {
+    let mut map = HashMap::new();
+    let valid_ids: std::collections::HashSet<u64> = current_chunks.iter().map(|c| c.id).collect();
+    for rec in read_sidecar(path)? {
+        if valid_ids.contains(&rec.chunk_id) {
+            map.insert(rec.chunk_id, rec.vec);
+        }
+    }
+    Ok(map)
+}
+
+/// Load the text hashes recorded in the sidecar: chunk_id -> hash
+/// of the text the stored embedding was computed from. Only v2
+/// records carry a hash, and only hashes for chunk_ids that exist
+/// in `current_chunks` are kept; later records win, as with the
+/// vectors. A current chunk with no entry here holds a v1
+/// (hashless) embedding and counts as stale at the gate.
+fn load_embedding_hashes(
+    path: &Path,
+    current_chunks: &[ChunkRec],
+) -> CoreResult<HashMap<u64, u64>> {
+    let mut map = HashMap::new();
+    let valid_ids: std::collections::HashSet<u64> = current_chunks.iter().map(|c| c.id).collect();
+    for rec in read_sidecar(path)? {
+        if let Some(h) = rec.text_hash {
+            if valid_ids.contains(&rec.chunk_id) {
+                map.insert(rec.chunk_id, h);
+            }
         }
     }
     Ok(map)
@@ -1237,7 +1417,11 @@ mod tests {
             val: String,
         }
 
-        let recs: Vec<Rec> = read_jsonl(&file).unwrap();
+        let out = read_jsonl(&file).unwrap();
+        let recs: Vec<Rec> = out.records;
+        // The two corrupted lines are counted as the caller's
+        // signal; the empty line is blank, not damage.
+        assert_eq!(out.skipped, 2);
         assert_eq!(recs.len(), 3);
         assert_eq!(recs[0].id, 1);
         assert_eq!(recs[1].id, 2);
@@ -1288,7 +1472,7 @@ mod tests {
             assert_eq!(ids, vec![1, 2]);
             let srcs: Vec<_> = st.sources.iter().map(|s| s.id).collect();
             assert_eq!(srcs, vec![1, 2]);
-            let turns: Vec<ChatTurn> = read_jsonl(&dir.join("turns.jsonl")).unwrap();
+            let turns: Vec<ChatTurn> = read_jsonl(&dir.join("turns.jsonl")).unwrap().records;
             assert_eq!(turns.len(), 2);
         }
     }
@@ -1423,6 +1607,53 @@ mod tests {
         let mut embedder = FakeEmbedder::new(8);
         let r = st.index_source(999, &mut embedder);
         assert!(matches!(r, Err(CoreError::SourceNotFound(999))));
+    }
+
+    /// Hash gate, migration leg (brief FB decision 2): a chunk
+    /// whose only sidecar record is the hashless v1 format counts
+    /// as stale — it is re-embedded exactly once (appending a v2
+    /// record), and from then on the gate holds it, in memory and
+    /// across a reload.
+    #[test]
+    fn v1_sidecar_record_reembeds_once_then_gate_holds() {
+        let dir = temp_dir();
+        let (src_id, chunk_id, vec0) = {
+            let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+            let nb = st.create_notebook("NB", 1).unwrap();
+            let src = st
+                .add_source(nb.id, SourceKind::Text, "src", "/s.txt", 2)
+                .unwrap();
+            let made = st
+                .set_source_text(src.id, "りんご みかん ばなな さくら もみじ")
+                .unwrap();
+            assert_eq!(made.len(), 1);
+            let mut emb = FakeEmbedder::new(8);
+            let v = emb.embed(&made[0].text).unwrap();
+            (src.id, made[0].id, v)
+        };
+        // Hand-write the sidecar in the v1 layout: chunk_id u64 LE,
+        // dim u32 LE (no hash flag), f32[dim] LE.
+        let sidecar = dir.join("emb_chunks.bin");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&chunk_id.to_le_bytes());
+        bytes.extend_from_slice(&(vec0.len() as u32).to_le_bytes());
+        for v in &vec0 {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        fs::write(&sidecar, &bytes).unwrap();
+        let v1_len = bytes.len() as u64;
+
+        let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+        let mut emb = FakeEmbedder::new(8);
+        // Stale (hashless): re-embedded once, v2 record appended.
+        assert_eq!(st.index_source(src_id, &mut emb).unwrap(), 1);
+        assert!(fs::metadata(&sidecar).unwrap().len() > v1_len);
+        // Gate holds in memory now.
+        assert_eq!(st.index_source(src_id, &mut emb).unwrap(), 0);
+        drop(st);
+        // And across a reload (the v2 record's hash wins).
+        let mut st = CoreState::new(&dir, EngineCfg::default(), "m").unwrap();
+        assert_eq!(st.index_source(src_id, &mut emb).unwrap(), 0);
     }
 
     #[test]

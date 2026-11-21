@@ -7,6 +7,12 @@
 //! and its abolition condition （廃止条件）: when the behaviour — or
 //! the annex formula — is corrected, un-ignore the test and move it
 //! back to `prop_tests.rs`.
+//!
+//! FC wave (2026-11-21): annex 2.6 and 2.4 met their abolition
+//! conditions (the implementation was corrected) and moved back to
+//! `prop_tests.rs`; annex 1.5 was rewritten there as the
+//! pass-through contract under FC decision 4. What remains here:
+//! 1.2, 1.3, 1.4, 2.2.
 
 use proptest::prelude::*;
 
@@ -95,24 +101,6 @@ proptest! {
         prop_assert_eq!(extract_txt(&bytes), normalize(&decoded));
     }
 
-    /// Annex 1.5 （形式整合・改行） — DOES NOT HOLD.
-    /// Minimal counterexample: b = [10] ("\n"): the output is "\n",
-    /// which starts with a blank line.
-    /// Mechanism: extract_txt performs newline normalization only —
-    /// no blank-line collapsing and no trimming (that post-processing
-    /// exists in the html/xhtml path, not the txt path).
-    /// Abolition: when extract_txt gains blank-line collapsing /
-    /// trimming (or the annex claim is withdrawn), un-ignore.
-    #[test]
-    #[ignore]
-    fn p1_5_extract_txt_newline_form(b in mixed_bytes()) {
-        let out = extract_txt(&b);
-        prop_assert!(!out.contains('\r'), "CR in output: {out:?}");
-        prop_assert!(!out.contains("\n\n"), "blank line in output: {out:?}");
-        prop_assert!(!out.starts_with('\n'), "leading blank: {out:?}");
-        prop_assert!(!out.ends_with('\n'), "trailing blank: {out:?}");
-    }
-
     /// Annex 2.2 （再実行等価） — DOES NOT HOLD.
     /// Minimal counterexample: s = "&lt;": once = "<", twice = "".
     /// Mechanism: entity decoding emits a literal '<' into the
@@ -128,23 +116,6 @@ proptest! {
         prop_assert_eq!(twice, once);
     }
 
-    /// Annex 2.6 （形式整合・出力） — DOES NOT HOLD (the '\r' clause).
-    /// Minimal counterexample: s = "a\rb": the output "a\rb" still
-    /// contains '\r'.
-    /// Mechanism: the post-processing splits on '\n' and strips only
-    /// a line-final '\r'; a lone '\r' inside a line survives, and
-    /// lines are trimmed at the edges only. (The other two clauses —
-    /// no "\n\n\n", trimmed fringe — were not the failing part.)
-    /// Abolition: when the post-processing also normalizes lone
-    /// in-line '\r', un-ignore.
-    #[test]
-    #[ignore]
-    fn p2_6_html_output_form(s in html_string()) {
-        let out = html_to_text(&s);
-        prop_assert!(!out.contains('\r'), "CR in output: {out:?}");
-        prop_assert!(!out.contains("\n\n\n"), "double blank in output: {out:?}");
-        prop_assert!(out.trim() == out.as_str(), "untrimmed fringe: {out:?}");
-    }
 }
 
 const SJIS_POOL: &str = "あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほ\
@@ -181,35 +152,3 @@ proptest! {
     }
 }
 
-const BLOCK_TAGS_ANNEX: &[&str] = &[
-    "p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li", "tr",
-    "section", "article", "blockquote", "header", "footer", "td", "th",
-];
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(1000))]
-
-    /// Annex 2.4 （ブロック改行整合） — DOES NOT HOLD for td/th.
-    /// Minimal counterexample: tags = ["td", "p"]: the live output
-    /// is "TK0\nTK1", the annex expectation is "TK0\n\nTK1".
-    /// Mechanism: td/th are not in html_to_text's block-tag list
-    /// (they are block-level only in xhtml_to_text's BLOCK_TAGS), so
-    /// a td boundary contributes no newline at all.
-    /// Abolition: when td/th join html_to_text's block list (or the
-    /// annex tag list is corrected), un-ignore.
-    #[test]
-    #[ignore]
-    fn p2_4_block_boundaries(
-        tags in prop::collection::vec(prop::sample::select(BLOCK_TAGS_ANNEX), 1..8),
-    ) {
-        let mut html = String::new();
-        let mut tokens = Vec::new();
-        for (i, tag) in tags.iter().enumerate() {
-            let tok = format!("TK{i}");
-            html.push_str(&format!("<{tag}>{tok}</{tag}>"));
-            tokens.push(tok);
-        }
-        let expected = tokens.join("\n\n");
-        prop_assert_eq!(html_to_text(&html), expected);
-    }
-}

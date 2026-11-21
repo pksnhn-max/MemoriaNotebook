@@ -387,7 +387,7 @@ mod fixture_tests {
         let path = fixture_path(rel);
         let content = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("fixture {rel} unreadable: {e}"));
-        let live: Vec<ChunkRec> = read_jsonl(&path).expect("live read_jsonl failed");
+        let live: Vec<ChunkRec> = read_jsonl(&path).expect("live read_jsonl failed").records;
         assert_eq!(live, expected_chunk_records(&content), "fixture {rel}");
     }
 
@@ -395,7 +395,7 @@ mod fixture_tests {
         let path = fixture_path(rel);
         let content = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("fixture {rel} unreadable: {e}"));
-        let live: Vec<u64> = read_jsonl(&path).expect("live read_jsonl failed");
+        let live: Vec<u64> = read_jsonl(&path).expect("live read_jsonl failed").records;
         assert_eq!(live, expected_deleted_ids(&content), "fixture {rel}");
     }
 
@@ -508,7 +508,7 @@ mod fixture_tests {
     #[test]
     fn undefined_bucket_inputs_do_not_panic() {
         let ledger = fixture_path("ledger/83_undefined_bucket.jsonl");
-        let _: Vec<ChunkRec> = read_jsonl(&ledger).expect("live read_jsonl failed");
+        let _: Vec<ChunkRec> = read_jsonl(&ledger).expect("live read_jsonl failed").records;
         let emb = fixture_path("emb/83_undefined_bucket.bin");
         let current = vec![chunk_rec(10), chunk_rec(11), chunk_rec(12)];
         let _ = load_embeddings(&emb, &current).expect("live load_embeddings failed");

@@ -9,10 +9,11 @@
 //!
 //! ケース数の床は生成する性質すべて 1,000（brief の裁定。annex の 200／500 行も引き上げ）。
 //!
-//! 既知の不成立（記録帳 W2 所見1）：ヘッダとして正当でも sample_rate が極端な WAV では
-//! `wav_duration_sec`（voice.rs:826）と `concat_wavs`（voice.rs:541）が u32 乗算の
-//! 溢れで panic する。生成性質のレート域は実在域（≤192,000）に置き、反例は
-//! `extreme_sample_rate_does_not_panic` に #[ignore] つきで残す（黙って弱めない）。
+//! 旧・既知の不成立（記録帳 W2 所見1）：ヘッダとして正当でも sample_rate が極端な
+//! WAV では `wav_duration_sec` と `concat_wavs` が u32 乗算の溢れで panic した。
+//! FA 修正（2026-11-21）で parse の境界検証が入り解消。反例は
+//! `extreme_sample_rate_does_not_panic` として回帰テスト化して常時走らせる。
+//! 生成性質のレート域は実在域（≤192,000）のまま。
 
 use notebook_core::voice::{
     build_script_prompt, concat_wavs, parse_script, voice_by_key, wav_duration_sec, VOICE_CATALOG,
@@ -597,10 +598,11 @@ fn duration_none_for_broken_headers() {
 }
 
 /// 所見1 の最小反例：sample_rate = u32::MAX、2ch、16bit のヘッダ正当な WAV。
-/// 現行実装は u32 乗算の溢れで panic する（voice.rs:826／541）。
-/// 実装が直ったらこの ignore を外し、回帰テストとして常時走らせる事。
+/// 旧実装は u32 乗算の溢れで panic した（voice.rs:826／541）。
+/// FA 修正（2026-11-21、brief FA）で廃止条件が成就したため回帰テストへ反転：
+/// parse の境界検証（sample_rate は 1〜384,000）で弾かれ、panic せず
+/// duration は None、concat は Err で返る事を assert する。
 #[test]
-#[ignore = "既知の不成立：記録帳 W2 所見1（極端な sample_rate で u32 乗算溢れ panic）"]
 fn extreme_sample_rate_does_not_panic() {
     let w = build_wav(&WavSpec {
         rate: u32::MAX,
@@ -611,8 +613,8 @@ fn extreme_sample_rate_does_not_panic() {
         extra_chunks: vec![],
         data_first: false,
     });
-    let _ = wav_duration_sec(&w); // panic せず Some/None で返る事
-    let _ = concat_wavs(&[w], 0); // panic せず Ok/Err で返る事
+    assert_eq!(wav_duration_sec(&w), None); // パースで弾かれ None（panic なし）
+    assert!(concat_wavs(&[w], 0).is_err()); // パースで弾かれ Err（panic なし）
 }
 
 // ---------------------------------------------------------------------------

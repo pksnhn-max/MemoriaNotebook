@@ -166,6 +166,129 @@ fn epub_like_bytes() -> impl Strategy<Value = Vec<u8>> {
     ]
 }
 
+// ---------- intended differences (allowlist, FC wave 2026-11-21) ----------
+//
+// The live html_to_text intentionally diverges from the frozen
+// oracle on exactly three behaviours, each fixed by a central
+// decision (brief FC). A live/oracle divergence is accepted ONLY
+// when the input touches at least one of the three classes below;
+// any other divergence fails. The flipped properties in
+// prop_tests.rs (2.6, 2.4) and the fixed examples in lib.rs pin the
+// new behaviours directly — this list only attributes divergences,
+// it does not weaken the equality check anywhere else.
+//
+// FC-D1 (CR normalization): the post-processing now applies full
+//   newline normalization (WHATWG Infra "normalize newlines"), so
+//   a lone CR in the text — literal, or decoded from a numeric
+//   entity such as &#13; — becomes LF where the oracle kept it.
+//   Class: the input contains '\r' or a numeric entity for U+000D.
+//   廃止条件： the oracle is retired to goldens (testing-manual
+//   §2), or html_to_text's normalization is reverted.
+// FC-D2 (td/th block breaks): td/th joined html_to_text's
+//   block-tag list (matching xhtml_to_text), so a cell boundary
+//   contributes a line break where the oracle contributed none.
+//   Class: the input contains a td/th tag (open or close).
+//   廃止条件： same as FC-D1.
+// FC-D3 (lone '<' is text): a '<' that cannot open a tag (end of
+//   input, or followed by a non-tag-open character) is emitted as
+//   literal text where the oracle dropped it (and the rest).
+//   Class: the input contains such a '<'.
+//   廃止条件： same as FC-D1.
+//
+// The class predicates are deliberate over-approximations at the
+// input level (e.g. a '\r' inside a script body, or a '<' inside a
+// quoted attribute value, marks the class even though that byte
+// never reaches the output); the alternative — reimplementing the
+// scanner as a classifier — would duplicate the code under test.
+
+fn touches_cr(s: &str) -> bool {
+    if s.contains('\r') {
+        return true;
+    }
+    // Numeric character references that decode to U+000D.
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    while i + 2 < b.len() {
+        if b[i] == b'&' && b[i + 1] == b'#' {
+            let rest = &s[i + 2..];
+            let Some(semi) = rest.find(';') else { break };
+            let body = &rest[..semi];
+            let value = if let Some(hex) = body.strip_prefix('x').or(body.strip_prefix('X')) {
+                u32::from_str_radix(hex, 16).ok()
+            } else {
+                body.parse::<u32>().ok()
+            };
+            if value == Some(13) {
+                return true;
+            }
+            i += 2 + semi;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+fn touches_td_th(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    let b = lower.as_bytes();
+    for i in 0..b.len() {
+        if b[i] != b'<' {
+            continue;
+        }
+        let mut j = i + 1;
+        if j < b.len() && b[j] == b'/' {
+            j += 1;
+        }
+        for tag in [b"td".as_slice(), b"th".as_slice()] {
+            if j + tag.len() <= b.len() && &b[j..j + tag.len()] == tag {
+                let after = b.get(j + tag.len());
+                if after.map_or(true, |c| !c.is_ascii_alphanumeric()) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn touches_lone_lt(s: &str) -> bool {
+    let b = s.as_bytes();
+    for i in 0..b.len() {
+        if b[i] == b'<' {
+            match b.get(i + 1) {
+                None => return true,
+                Some(&c)
+                    if !(c.is_ascii_alphabetic() || c == b'/' || c == b'!' || c == b'?') =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+fn touches_intended_difference(s: &str) -> bool {
+    touches_cr(s) || touches_td_th(s) || touches_lone_lt(s)
+}
+
+/// Live vs oracle for html_to_text, with the FC allowlist above:
+/// equal, or the divergence is attributable to an intended class.
+fn html_diff_check(s: &str) -> Result<(), TestCaseError> {
+    let live = html_to_text(s);
+    let frozen = oracle::html_to_text(s);
+    if live == frozen {
+        return Ok(());
+    }
+    prop_assert!(
+        touches_intended_difference(s),
+        "unexplained divergence from oracle: input {s:?}, live {live:?}, oracle {frozen:?}"
+    );
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(1000))]
 
@@ -191,12 +314,12 @@ proptest! {
 
     #[test]
     fn diff_html_to_text_fragments(s in html_string()) {
-        prop_assert_eq!(html_to_text(&s), oracle::html_to_text(&s));
+        html_diff_check(&s)?;
     }
 
     #[test]
     fn diff_html_to_text_arbitrary(s in any::<String>()) {
-        prop_assert_eq!(html_to_text(&s), oracle::html_to_text(&s));
+        html_diff_check(&s)?;
     }
 
     #[test]

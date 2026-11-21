@@ -117,6 +117,10 @@ fn epub_like_bytes() -> impl Strategy<Value = Vec<u8>> {
 
 // ---------- §1 extract_txt ----------
 
+fn normalize(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(1000))]
 
@@ -124,6 +128,36 @@ proptest! {
     #[test]
     fn p1_1_extract_txt_never_panics(b in mixed_bytes()) {
         let _ = extract_txt(&b);
+    }
+
+    /// Annex 1.5, rewritten under FC decision 4 (2026-11-21): the
+    /// annex's original form expected blank-line collapsing and
+    /// trimming, but extract_txt's contract is plain-text
+    /// pass-through — the Tika-shaped job (a .txt file in, its text
+    /// out), as opposed to the structure-rebuilding extractors
+    /// (trafilatura / html2text / pandoc), whose outputs cap blank
+    /// lines. The family choice is recorded in the FC record book.
+    /// The pass-through contract: apart from stripping one leading
+    /// BOM, decoding, and newline normalization, the content is
+    /// preserved exactly — blank lines are NOT collapsed and
+    /// nothing is trimmed. For valid UTF-8 input that is exactly
+    /// normalize_newlines(input), with or without one BOM. (A
+    /// leading U+FEFF in the string itself is indistinguishable
+    /// from a BOM at the byte level — annex 1.2/1.3 territory — so
+    /// the strategy excludes it.)
+    #[test]
+    fn p1_5_extract_txt_pass_through_contract(
+        s in any::<String>().prop_filter("leading U+FEFF is the BOM case", |s| {
+            !s.starts_with('\u{feff}')
+        }),
+        bom in any::<bool>(),
+    ) {
+        let mut bytes = Vec::new();
+        if bom {
+            bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+        }
+        bytes.extend_from_slice(s.as_bytes());
+        prop_assert_eq!(extract_txt(&bytes), normalize(&s));
     }
 
 }
@@ -137,6 +171,20 @@ proptest! {
     #[test]
     fn p2_1_html_never_panics(s in prop_oneof![html_string(), any::<String>()]) {
         let _ = html_to_text(&s);
+    }
+
+    /// Annex 2.6 （形式整合・出力）, flipped from props_not_holding
+    /// under FC decision 1 (2026-11-21): the post-processing now
+    /// applies full newline normalization (CRLF -> LF, then every
+    /// remaining CR -> LF) before the line collapse, so no '\r'
+    /// survives — including a lone CR inside a line. Kept in its
+    /// original, unweakened form.
+    #[test]
+    fn p2_6_html_output_form(s in html_string()) {
+        let out = html_to_text(&s);
+        prop_assert!(!out.contains('\r'), "CR in output: {out:?}");
+        prop_assert!(!out.contains("\n\n\n"), "double blank in output: {out:?}");
+        prop_assert!(out.trim() == out.as_str(), "untrimmed fringe: {out:?}");
     }
 
 }
@@ -198,6 +246,36 @@ proptest! {
     }
 }
 
+const BLOCK_TAGS_ANNEX: &[&str] = &[
+    "p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li", "tr",
+    "section", "article", "blockquote", "header", "footer", "td", "th",
+];
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1000))]
+
+    /// Annex 2.4 （ブロック改行整合）, flipped from
+    /// props_not_holding under FC decision 2 (2026-11-21): td/th
+    /// joined html_to_text's block-tag list, so a cell boundary
+    /// contributes a line break exactly like xhtml_to_text's
+    /// BLOCK_TAGS already did. Kept in its original, unweakened
+    /// form.
+    #[test]
+    fn p2_4_block_boundaries(
+        tags in prop::collection::vec(prop::sample::select(BLOCK_TAGS_ANNEX), 1..8),
+    ) {
+        let mut html = String::new();
+        let mut tokens = Vec::new();
+        for (i, tag) in tags.iter().enumerate() {
+            let tok = format!("TK{i}");
+            html.push_str(&format!("<{tag}>{tok}</{tag}>"));
+            tokens.push(tok);
+        }
+        let expected = tokens.join("\n\n");
+        prop_assert_eq!(html_to_text(&html), expected);
+    }
+}
+
 const NAMED_ENTITIES: &[(&str, char)] = &[
     ("amp", '&'),
     ("lt", '<'),
@@ -225,13 +303,17 @@ proptest! {
     }
 
     /// Annex 2.5: numeric entities (decimal and hex) decode to the
-    /// char for every Unicode scalar value.
+    /// char for every Unicode scalar value. One composition: a
+    /// decoded CR is then rewritten to LF by the post-processing's
+    /// full newline normalization (FC decision 1, 2026-11-21), so
+    /// the expected char for U+000D is '\n'.
     #[test]
     fn p2_5_numeric_entities_decode(c in any::<char>()) {
+        let expected = if c == '\r' { '\n' } else { c };
         let dec = format!("X&#{};Y", c as u32);
-        prop_assert_eq!(html_to_text(&dec), format!("X{c}Y"));
+        prop_assert_eq!(html_to_text(&dec), format!("X{expected}Y"));
         let hex = format!("X&#x{:X};Y", c as u32);
-        prop_assert_eq!(html_to_text(&hex), format!("X{c}Y"));
+        prop_assert_eq!(html_to_text(&hex), format!("X{expected}Y"));
     }
 
     /// Annex 2.5: numeric entities outside the scalar range

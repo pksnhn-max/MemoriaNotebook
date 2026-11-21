@@ -10,13 +10,17 @@
 //! Every generated property runs at 1,000 cases (brief contract; the
 //! annex's 100-case row for 1-4 is raised to 1,000 as well).
 //!
-//! Two tests are the annex's claims taken literally and are EXPECTED
-//! TO FAIL on the current implementation; they are kept failing, not
-//! ignored and not weakened (brief contract — the supervisor
-//! collates). See the W1 record book
-//! (~/workspace/notebook-design/records/2026-11-21-w1-core-props.md):
-//!   - `chunk_length_cap_annex_literal` (candidate 1-2)
-//!   - `index_source_no_reembedding_annex_literal` (candidate 3-5)
+//! History: two tests here were the annex's claims taken literally
+//! and kept ignored against the old implementation (candidate 1-2
+//! chunk cap, candidate 3-5 no-reembedding; see the W1 record book
+//! ~/workspace/notebook-design/records/2026-11-21-w1-core-props.md).
+//! Brief FB (2026-11-21) settled both: 3-5 by changing the
+//! implementation (hash gate — regression flip, the test now runs
+//! as `index_source_no_reembedding`), and 1-2 by correcting the
+//! documented contract to the implementation's real one
+//! (`chunk_length_within_double_target` — a yardstick item,
+//! proposed to the human, see the FB record book
+//! ~/workspace/notebook-design/records/2026-11-21-fb-core-fix.md).
 
 use notebook_core::{
     chunk_text, embed_chunks, CoreError, CoreResult, CoreState, Embedder, EngineCfg,
@@ -246,21 +250,24 @@ proptest! {
         prop_assert!(chunks.iter().all(|c| !c.is_empty() && !c.contains("\n\n")));
     }
 
-    /// Candidate 1-2 AS WRITTEN IN THE ANNEX: every chunk is at most
-    /// CHUNK_TARGET_CHARS characters. Expected to FAIL on the current
-    /// implementation (a single paragraph of 401..=800 chars is packed
-    /// as one chunk; the code's own doc says "roughly"). Kept literal
-    /// per the brief contract; see the W1 record book.
+    /// Candidate 1-2, real-contract form (brief FB decision 3;
+    /// yardstick item — the expectation side changed, see the FB
+    /// record book): `CHUNK_TARGET_CHARS` is a target, not a cap.
+    /// Paragraphs are packed up to the target, a single paragraph
+    /// stays whole up to twice the target, and longer paragraphs
+    /// are hard-split — so every chunk is at most
+    /// `2 * CHUNK_TARGET_CHARS`. (The hard-split pieces' own bound,
+    /// at most `CHUNK_TARGET_CHARS`, is asserted by
+    /// `chunk_hard_split_concat`.)
     #[test]
-    #[ignore = "現行不成立（annex額面）: 401字の単一段落が401字チャンクになる（docはroughly、定数はTARGET、hard_splitは800字超のみ）。廃止条件: chunk_textが上限読みに変わるか、annex額面が目標読みへ訂正される事。詳細はW1記録帳"]
-    fn chunk_length_cap_annex_literal(text in arb_text()) {
+    fn chunk_length_within_double_target(text in arb_text()) {
         let chunks = chunk_text(&text);
         for c in &chunks {
             prop_assert!(
-                c.chars().count() <= CHUNK_TARGET_CHARS,
-                "chunk of {} chars exceeds target {}",
+                c.chars().count() <= 2 * CHUNK_TARGET_CHARS,
+                "chunk of {} chars exceeds twice the target {}",
                 c.chars().count(),
-                CHUNK_TARGET_CHARS
+                2 * CHUNK_TARGET_CHARS
             );
         }
     }
@@ -348,6 +355,18 @@ fn nb_op() -> impl Strategy<Value = NbOp> {
     ]
 }
 
+/// FNV-1a (64-bit), written from the algorithm's definition for
+/// the sidecar format check — deliberately not shared with the
+/// implementation under test.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(1000))]
 
@@ -409,7 +428,11 @@ proptest! {
     /// Candidate 2-4 (format integrity): the records `embed_chunks`
     /// writes to emb_chunks.bin parse back, with an independent
     /// minimal parser written here, to exactly the input pairs —
-    /// chunk_id u64 LE, dim u32 LE, f32[dim] LE, no trailing bytes.
+    /// format v2 (brief FB decision 2): chunk_id u64 LE, dim u32 LE
+    /// with the top flag bit set, text hash u64 LE (FNV-1a of the
+    /// chunk text, reimplemented below from the algorithm's
+    /// definition so the check shares no code with the writer),
+    /// f32[dim] LE, no trailing bytes.
     #[test]
     fn emb_sidecar_format_independent_parse(
         table in prop::collection::vec(
@@ -442,11 +465,21 @@ proptest! {
         let mut pos = 0usize;
         let mut recs: Vec<(u64, Vec<u32>)> = Vec::new();
         while pos < bytes.len() {
-            prop_assert!(pos + 12 <= bytes.len(), "trailing partial header at {pos}");
+            prop_assert!(pos + 20 <= bytes.len(), "trailing partial header at {pos}");
             let id = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
-            let dim =
-                u32::from_le_bytes(bytes[pos + 8..pos + 12].try_into().unwrap()) as usize;
-            pos += 12;
+            let dim_word =
+                u32::from_le_bytes(bytes[pos + 8..pos + 12].try_into().unwrap());
+            prop_assert!(
+                dim_word & 0x8000_0000 != 0,
+                "v2 record must carry the hash flag (dim word {dim_word:#x})"
+            );
+            let dim = (dim_word & !0x8000_0000) as usize;
+            let hash = u64::from_le_bytes(bytes[pos + 12..pos + 20].try_into().unwrap());
+            // The chunk texts in this test are the enumeration
+            // index as a string, in record order.
+            let expect_hash = fnv1a64(recs.len().to_string().as_bytes());
+            prop_assert_eq!(hash, expect_hash, "record {} text hash", recs.len());
+            pos += 20;
             prop_assert!(pos + dim * 4 <= bytes.len(), "record overruns file");
             let mut bits = Vec::new();
             for _ in 0..dim {
@@ -747,8 +780,12 @@ proptest! {
     }
 
     /// Candidate 3-5, state-equivalence leg: a second `index_source`
-    /// call returns the same count and leaves the observable state —
-    /// search results in memory and after a reload — unchanged.
+    /// call leaves the observable state — search results in memory
+    /// and after a reload — unchanged. Its return count follows the
+    /// hash-gate contract (brief FB decision 2): the first call
+    /// embeds every chunk, the second embeds nothing, where the
+    /// pre-gate implementation re-embedded and returned the same
+    /// count; the equivalence assertions below are unchanged.
     #[test]
     fn index_source_second_run_state_equivalent(
         text in prop::collection::vec(single_chunk_para(300), 1..=5)
@@ -776,23 +813,24 @@ proptest! {
         };
         let hits1 = snap(&st);
         prop_assert!(!hits1.is_empty());
+        prop_assert_eq!(n1, made.len());
         let n2 = st.index_source(src.id, &mut emb).unwrap();
-        prop_assert_eq!(n1, n2);
+        prop_assert_eq!(n2, 0, "second run must embed nothing (hash gate)");
         prop_assert_eq!(&hits1, &snap(&st));
         drop(st);
         let st2 = CoreState::new(dir.path(), EngineCfg::default(), "props").unwrap();
         prop_assert_eq!(hits1, snap(&st2));
     }
 
-    /// Candidate 3-5 AS WRITTEN IN THE ANNEX (no-reembedding form):
-    /// a second `index_source` call embeds nothing again and the
-    /// sidecar does not grow. Expected to FAIL on the current
-    /// implementation (`index_prepare` returns every chunk each time
-    /// and `embed_chunks` appends). Kept literal per the brief
-    /// contract; see the W1 record book.
+    /// Candidate 3-5 (no-reembedding form, now the standing
+    /// contract): a second `index_source` call on unchanged text
+    /// embeds nothing again and the sidecar does not grow — the
+    /// hash gate in `index_prepare` withholds chunks whose stored
+    /// embedding was computed from the current text. This was the
+    /// annex's claim, kept ignored until brief FB (2026-11-21)
+    /// changed the implementation to meet it (regression flip).
     #[test]
-    #[ignore = "現行不成立（annex額面）: index_source 2回目で全件再埋め込み+sidecar追記（状態等価の脚は緑）。廃止条件: 再埋め込みなしの実装になるか、物差しが意図された効果（RFC 9110）読みへ裁定される事。詳細はW1記録帳"]
-    fn index_source_no_reembedding_annex_literal(
+    fn index_source_no_reembedding(
         text in prop::collection::vec(single_chunk_para(300), 1..=5)
             .prop_map(|ps| ps.join("\n\n")),
     ) {

@@ -58,6 +58,19 @@ pub fn html_to_text(html: &str) -> String {
     let lb = lower.as_bytes();
     while i < b.len() {
         if b[i] == b'<' {
+            // A '<' that cannot open a tag — at end of input, or
+            // followed by anything other than a tag-open character
+            // (ASCII letter, '/', '!', '?') — is literal text, as in
+            // the HTML tokenizer's tag-open state. A '<' + letter
+            // with no closing '>' is an unterminated tag and is
+            // still dropped with the rest, as before.
+            let tag_open = matches!(b.get(i + 1), Some(&c)
+                if c.is_ascii_alphabetic() || c == b'/' || c == b'!' || c == b'?');
+            if !tag_open {
+                out.push('<');
+                i += 1;
+                continue;
+            }
             // Find the end of the tag, skipping '>' inside quoted
             // attribute values.
             let mut end = None;
@@ -100,8 +113,8 @@ pub fn html_to_text(html: &str) -> String {
             }
             if matches!(
                 name.as_str(),
-                "p" | "div" | "br" | "li" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
-                    | "section" | "article" | "blockquote" | "header" | "footer"
+                "p" | "div" | "br" | "li" | "tr" | "td" | "th" | "h1" | "h2" | "h3" | "h4"
+                    | "h5" | "h6" | "section" | "article" | "blockquote" | "header" | "footer"
             ) {
                 out.push('\n');
             }
@@ -158,6 +171,11 @@ pub fn html_to_text(html: &str) -> String {
             i = upto;
         }
     }
+    // Full newline normalization (WHATWG Infra "normalize
+    // newlines", the same form extract_txt uses): CRLF -> LF, then
+    // every remaining CR -> LF. Without this, a lone CR inside a
+    // line survived the line-splitting below.
+    let out = normalize_newlines(&out);
     let mut lines: Vec<&str> = Vec::new();
     for line in out.lines() {
         let line = line.trim();
@@ -433,6 +451,17 @@ mod tests {
         let text = html_to_text(html);
         assert!(text.contains("天満川の水位 & 記録"), "{text}");
         assert!(!text.contains("var x"), "{text}");
+    }
+
+    #[test]
+    fn html_lone_lt_is_literal_text() {
+        // '<' at end of input: literal text, not a dropped tag.
+        assert_eq!(html_to_text("<"), "<");
+        // '<' followed by a non-tag-open character: literal text.
+        assert_eq!(html_to_text("a < b"), "a < b");
+        // '<' + letter with no closing '>': unterminated tag,
+        // dropped with the rest, as before.
+        assert_eq!(html_to_text("<abc"), "");
     }
 
     #[test]
